@@ -1,0 +1,13 @@
+product:
+  name: CimianCommitsListener
+  version: 2025.04.16
+  developer: <your-org>
+  identifier: com.domain.cimian.CommitsListener
+  description: >-
+    AWS SQS listener for a Windows Cimian caching server. On a commit event it
+    runs git pull + aws s3 sync to refresh the local deployment tree.
+    Sample/template — all connection details are env-driven, none are baked in.
+architecture: x64
+install_location: C:\Program Files\
+postinstall_action: none
+signing_certificate: <signing-cert-subject-or-thumbprint>

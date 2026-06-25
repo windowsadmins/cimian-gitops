@@ -1,0 +1,11 @@
+{
+  "name": "cimian-commits-listener",
+  "version": "2025.04.16",
+  "private": true,
+  "type": "module",
+  "description": "Azure Service Bus listener that refreshes a Windows Cimian caching server.",
+  "main": "service-bus-listener.js",
+  "dependencies": {
+    "@azure/service-bus": "^7.9.4"
+  }
+}

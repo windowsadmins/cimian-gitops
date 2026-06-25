@@ -1,0 +1,12 @@
+product:
+  name: CimianPreflight
+  version: 2025.06.06
+  developer: <your-org>
+  identifier: com.domain.cimian.preflight
+  description: >-
+    Installs a Cimian preflight.ps1 that runs before each managedsoftwareupdate
+    check. Sample/template — edit preflight.ps1 for your environment.
+architecture: x64
+install_location: C:\Program Files\Cimian\
+postinstall_action: none
+signing_certificate: <signing-cert-subject-or-thumbprint>

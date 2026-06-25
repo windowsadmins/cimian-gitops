@@ -1,0 +1,372 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  bootstrap-to-intune.yml — push the BootstrapMate stack to Intune as a Win32 LOB
+#
+#  This is the "MDM as a dumb approved pipe" pattern. Intune does ONE job: deliver
+#  a single signed bootstrapper (BootstrapMate) to a freshly-enrolled device during
+#  the Enrollment Status Page. Everything else — the actual app stack, configs,
+#  patch state — is orchestrated by Cimian pulling from the GitOps repo, NOT by
+#  Intune. The MDM never sees the package catalog; it only ever delivers the pipe.
+#
+#  What this pipeline does, end to end:
+#    1. PrepareAgent — import the code-signing cert from Key Vault onto the agent.
+#    2. Build       — fetch the upstream BootstrapMate MSI, re-sign it with the org
+#                     cert, and wrap it into an .intunewin with IntuneWinAppUtil.
+#    3. Publish     — regenerate management.json (the BootstrapMate manifest that
+#                     lists the first-boot payload), upload it to blob storage, and
+#                     purge the CDN so devices see it immediately.
+#    4. Deploy      — create/replace the Win32 LOB in Intune via Microsoft Graph,
+#                     upload the encrypted content, and assign it to a device group.
+#
+#  Nothing here is org-specific except the variables block — every name, vault,
+#  tenant, and group is a placeholder. Swap them for yours and it runs.
+#
+#  Companion AWS form (S3 + a GitHub Actions runner) lives at
+#  ../github/bootstrap-to-intune.yml.
+# ──────────────────────────────────────────────────────────────────────────────
+
+trigger: none          # release-style: run manually or from a schedule, not on push
+
+parameters:
+  - name: stages
+    displayName: "Stage(s) to run"
+    type: string
+    default: Full
+    values:
+      - Full            # PrepareAgent + Build + Publish + Deploy
+      - Build           # fetch + sign + wrap .intunewin only
+      - Publish         # regenerate management.json + blob upload + CDN purge
+      - Deploy          # Win32 LOB upload to Intune + assignment
+
+  - name: bootstrapMateTag
+    displayName: "BootstrapMate release tag (bootstrapmate/windows)"
+    type: string
+    default: latest
+
+  - name: assignmentGroupId
+    displayName: "Entra group object ID to assign the Win32 app to"
+    type: string
+    default: '<entra-group-object-id>'
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  # ── ADO variable group: holds the tenant ID and any Graph app credentials.
+  #    Create it in Project Settings → Library. Never hard-code secrets here.
+  - group: cimian-repo-secrets
+
+  # ── Service connection with rights to Key Vault, Storage, and Graph.
+  - name: azureServiceConnection
+    value: '<ADO-service-connection>'
+
+  # ── Code-signing cert, stored base64 in Key Vault as a secret.
+  - name: signingKeyVault
+    value: '<signing-key-vault>'
+  - name: signingCertName
+    value: '<signing-cert-secret-name>'
+
+  # ── Blob storage that fronts the BootstrapMate manifest via your CDN.
+  - name: storageAccount
+    value: '<storage-account>'
+  - name: bootstrapContainer
+    value: 'bootstrap'
+  - name: managementJsonUrl
+    value: 'https://cimian.example.com/bootstrap/management.json'
+
+  # ── CDN (Azure Front Door) endpoint that caches the manifest at the edge.
+  - name: cdnResourceGroup
+    value: '<resource-group>'
+  - name: cdnProfile
+    value: '<frontdoor-profile>'
+  - name: cdnEndpoint
+    value: '<frontdoor-endpoint>'
+
+  # ── Microsoft Graph. beta is required for several Win32 LOB fields.
+  - name: graphBase
+    value: 'https://graph.microsoft.com/beta'
+
+stages:
+
+# ── 1. PrepareAgent ───────────────────────────────────────────────────────────
+- ${{ if or(eq(parameters.stages, 'Full'), eq(parameters.stages, 'Build')) }}:
+  - stage: PrepareAgent
+    displayName: "Import signing cert + verify toolchain"
+    jobs:
+    - job: prep
+      displayName: "Import code-signing cert from Key Vault"
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Import code-signing cert from Key Vault'
+        name: importSigningCert
+        inputs:
+          azureSubscription: '$(azureServiceConnection)'
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+            # The cert is stored base64-encoded as a Key Vault secret (PFX bytes).
+            $b64 = az keyvault secret show --vault-name '$(signingKeyVault)' --name '$(signingCertName)' --query 'value' -o tsv
+            if (-not $b64) { throw "Empty secret '$(signingCertName)' in '$(signingKeyVault)'" }
+            $pfx = [IO.Path]::GetTempFileName() + '.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($b64))
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My
+            Remove-Item $pfx -Force
+            Write-Host "##vso[task.setvariable variable=signingCertThumbprint;isOutput=true]$($cert.Thumbprint)"
+            Write-Host "Imported cert with thumbprint $($cert.Thumbprint)"
+
+      - powershell: |
+          # Confirm the tools the Build stage needs are present on the agent.
+          foreach ($t in 'signtool.exe','dotnet') {
+            $c = Get-Command $t -EA SilentlyContinue
+            Write-Host ("{0}: {1}" -f $t, ($(if ($c) { $c.Source } else { 'MISSING' })))
+          }
+        displayName: "Verify signtool / .NET"
+
+# ── 2. Build ──────────────────────────────────────────────────────────────────
+- ${{ if or(eq(parameters.stages, 'Full'), eq(parameters.stages, 'Build')) }}:
+  - stage: Build
+    displayName: "Fetch + sign BootstrapMate, build .intunewin"
+    dependsOn: PrepareAgent
+    variables:
+      signingCertThumbprint: $[ stageDependencies.PrepareAgent.prep.outputs['importSigningCert.signingCertThumbprint'] ]
+    jobs:
+    - job: build_bootstrapmate
+      displayName: "Fetch + sign + wrap BootstrapMate (x64)"
+      steps:
+      - powershell: |
+          # Fetch the upstream MSI from the public BootstrapMate release.
+          # github.com/bootstrapmate/windows is public — no auth needed.
+          $tag = '${{ parameters.bootstrapMateTag }}'
+          $rel = if ($tag -eq 'latest') { 'latest/download' } else { "download/$tag" }
+          $url = "https://github.com/bootstrapmate/windows/releases/$rel/BootstrapMate-x64.msi"
+          New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)/intune" | Out-Null
+          $msi = "$(Build.ArtifactStagingDirectory)/intune/BootstrapMate-x64.msi"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+        displayName: 'Fetch BootstrapMate x64 MSI'
+
+      - powershell: |
+          # Re-sign with the org cert so the MSI chains to your enterprise root.
+          $thumb = '$(signingCertThumbprint)'
+          if (-not $thumb) { throw "No signing thumbprint from PrepareAgent" }
+          $msi = "$(Build.ArtifactStagingDirectory)/intune/BootstrapMate-x64.msi"
+          $tsa = 'http://timestamp.digicert.com'
+          & signtool.exe sign /sha1 $thumb /fd SHA256 /tr $tsa /td SHA256 /q $msi
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+          Write-Host "Signed BootstrapMate-x64.msi"
+        displayName: 'Sign BootstrapMate MSI'
+
+      - powershell: |
+          # Wrap the signed MSI into an .intunewin. IntuneWinAppUtil encrypts the
+          # payload and writes Detection.xml metadata the Deploy stage reads back.
+          $tool = "$(Agent.TempDirectory)/IntuneWinAppUtil.exe"
+          Invoke-WebRequest -UseBasicParsing -OutFile $tool `
+            'https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe'
+          $src = "$(Build.ArtifactStagingDirectory)/intune"
+          & $tool -c $src -s "$src/BootstrapMate-x64.msi" -o $src -q
+          if ($LASTEXITCODE -ne 0) { throw "IntuneWinAppUtil failed ($LASTEXITCODE)" }
+          Get-ChildItem "$src/*.intunewin" | ForEach-Object { Write-Host "Built $($_.Name)" }
+        displayName: 'Build .intunewin (x64 only — Win32 LOB is x64)'
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish BootstrapMate .intunewin + MSI'
+        inputs:
+          targetPath: '$(Build.ArtifactStagingDirectory)/intune'
+          artifact: 'bootstrapmate-intune'
+
+# ── 3. Publish ────────────────────────────────────────────────────────────────
+- ${{ if or(eq(parameters.stages, 'Full'), eq(parameters.stages, 'Publish')) }}:
+  - stage: Publish
+    displayName: "Regen management.json + blob upload + CDN purge"
+    dependsOn: []
+    jobs:
+    - job: publish_manifest
+      displayName: "Upload management.json + purge CDN"
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Regenerate + upload management.json, purge CDN'
+        inputs:
+          azureSubscription: '$(azureServiceConnection)'
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+            # management.json is the first-boot payload manifest BootstrapMate reads
+            # at the Enrollment Status Page. It lists the handful of packages that
+            # must land before the desktop appears (the Cimian agent, its config,
+            # ReportMate). It is intentionally tiny — the full app stack is pulled
+            # by Cimian afterward from the GitOps repo, never from here.
+            $manifest = '$(Build.SourcesDirectory)/provisioning/public/management.json'
+            if (-not (Test-Path $manifest)) { throw "management.json not found at $manifest" }
+
+            az storage blob upload `
+              --account-name '$(storageAccount)' `
+              --container-name '$(bootstrapContainer)' `
+              --name 'management.json' `
+              --file $manifest `
+              --content-type 'application/json' `
+              --overwrite true `
+              --auth-mode login
+            Write-Host "Uploaded management.json → $(managementJsonUrl)"
+
+            az afd endpoint purge `
+              --resource-group '$(cdnResourceGroup)' `
+              --profile-name '$(cdnProfile)' `
+              --endpoint-name '$(cdnEndpoint)' `
+              --content-paths '/bootstrap/*'
+            Write-Host "Purged CDN edge cache for /bootstrap/*"
+
+# ── 4. Deploy ─────────────────────────────────────────────────────────────────
+- ${{ if or(eq(parameters.stages, 'Full'), eq(parameters.stages, 'Deploy')) }}:
+  - stage: Deploy
+    displayName: "Upload Win32 LOB to Intune + assign"
+    dependsOn: Build
+    jobs:
+    - job: deploy_intune
+      displayName: "Create/replace Win32 LOB via Microsoft Graph"
+      steps:
+      - download: current
+        artifact: bootstrapmate-intune
+        displayName: 'Download BootstrapMate .intunewin'
+
+      - task: AzureCLI@2
+        displayName: 'Upload + assign Win32 LOB'
+        inputs:
+          azureSubscription: '$(azureServiceConnection)'
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+            $ErrorActionPreference = 'Stop'
+            $graphBase = '$(graphBase)'
+            $token = az account get-access-token --resource 'https://graph.microsoft.com' --query accessToken -o tsv
+            $h = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
+
+            $displayName = 'BootstrapMate'
+            $intuneWin = Get-ChildItem '$(Pipeline.Workspace)/bootstrapmate-intune' -Filter '*.intunewin' -Recurse | Select-Object -First 1
+            if (-not $intuneWin) { throw "No .intunewin in artifact" }
+
+            # ── Step 1: remove any prior win32LobApp with the same displayName.
+            #    The pipeline is the single source of truth — replace, never stack.
+            $encoded = [Uri]::EscapeDataString($displayName)
+            $listUrl = "$graphBase/deviceAppManagement/mobileApps?`$filter=isof('microsoft.graph.win32LobApp')+and+displayName+eq+'$encoded'&`$select=id"
+            foreach ($app in (Invoke-RestMethod -Uri $listUrl -Headers $h).value) {
+                Write-Host "Deleting existing app $($app.id)"
+                Invoke-RestMethod -Uri "$graphBase/deviceAppManagement/mobileApps/$($app.id)" -Headers $h -Method DELETE | Out-Null
+            }
+
+            # ── Step 2: read Detection.xml + the encrypted payload out of the
+            #    .intunewin (it's a ZIP: IntuneWinPackage/Contents/IntunePackage.intunewin
+            #    is the encrypted blob, IntuneWinPackage/Metadata/Detection.xml the meta).
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $work = Join-Path $env:AGENT_TEMPDIRECTORY ([Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $work | Out-Null
+            $zip = [IO.Compression.ZipFile]::OpenRead($intuneWin.FullName)
+            try {
+                ($zip.Entries | Where-Object FullName -eq 'IntuneWinPackage/Metadata/Detection.xml')[0] |
+                    ForEach-Object { [IO.Compression.ZipFileExtensions]::ExtractToFile($_, "$work/Detection.xml", $true) }
+                ($zip.Entries | Where-Object FullName -eq 'IntuneWinPackage/Contents/IntunePackage.intunewin')[0] |
+                    ForEach-Object { [IO.Compression.ZipFileExtensions]::ExtractToFile($_, "$work/payload.bin", $true) }
+            } finally { $zip.Dispose() }
+            [xml]$det = Get-Content "$work/Detection.xml"
+            $info = $det.ApplicationInfo
+            $enc  = $info.EncryptionInfo
+
+            # ── Step 3: create the win32LobApp shell. The body shape mirrors what
+            #    the IntuneWin32App PowerShell module posts — Graph rejects the call
+            #    with an opaque "detectionRules schema" error if peer fields are missing.
+            $detectionRules = @(@{
+                '@odata.type'         = '#microsoft.graph.win32LobAppProductCodeDetection'
+                productCode           = $info.MsiInfo.MsiProductCode
+                productVersionOperator= 'notConfigured'
+            })
+            $appBody = [ordered]@{
+                '@odata.type'                  = '#microsoft.graph.win32LobApp'
+                displayName                    = $displayName
+                description                    = 'First-boot bootstrapper. Delivered once at the ESP; Cimian orchestrates everything else from the GitOps repo.'
+                publisher                      = '<your-org>'
+                fileName                       = $intuneWin.Name
+                setupFilePath                  = [string]$info.SetupFile
+                installCommandLine             = 'msiexec /i "BootstrapMate-x64.msi" /qn'
+                uninstallCommandLine           = 'msiexec /x "{PRODUCT-CODE}" /qn'
+                installExperience              = @{ runAsAccount='system'; deviceRestartBehavior='suppress'; maxRunTimeInMinutes=60 }
+                minimumSupportedWindowsRelease = 'Windows11_22H2'
+                allowedArchitectures           = 'x64'
+                applicableArchitectures        = 'none'
+                runAs32bit                     = $false
+                detectionRules                 = $detectionRules
+                returnCodes                    = @(
+                    @{ returnCode=0; type='success' }, @{ returnCode=1707; type='success' },
+                    @{ returnCode=3010; type='softReboot' }, @{ returnCode=1641; type='hardReboot' },
+                    @{ returnCode=1618; type='retry' })
+            }
+            $app = Invoke-RestMethod -Uri "$graphBase/deviceAppManagement/mobileApps" -Headers $h -Method POST -Body ($appBody | ConvertTo-Json -Depth 20)
+            $appId = $app.id
+            Write-Host "Created win32LobApp $appId"
+
+            # ── Step 4-8: content version → register file → wait for the Azure
+            #    Storage SAS URL → block-upload the encrypted payload → commit.
+            $cv = Invoke-RestMethod -Method POST -Headers $h -Body '{}' `
+                -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions"
+            $fBody = @{ '@odata.type'='#microsoft.graph.mobileAppContentFile'; name=$intuneWin.Name
+                       size=[int64]$info.UnencryptedContentSize
+                       sizeEncrypted=(Get-Item "$work/payload.bin").Length; isDependency=$false } | ConvertTo-Json
+            $fileBase = "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$($cv.id)/files"
+            $file = Invoke-RestMethod -Uri $fileBase -Headers $h -Method POST -Body $fBody
+            $fileUrl = "$fileBase/$($file.id)"
+
+            $sas = $null; $deadline = (Get-Date).AddMinutes(10)
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep 3
+                $f = Invoke-RestMethod -Uri $fileUrl -Headers $h
+                if ($f.uploadState -eq 'azureStorageUriRequestSuccess') { $sas = $f.azureStorageUri; break }
+                if ($f.uploadState -like '*Failed*') { throw "SAS request failed: $($f.uploadState)" }
+            }
+            if (-not $sas) { throw "Timed out waiting for SAS URL" }
+
+            # Block-blob upload in chunks. iso-8859-1 round-trips raw bytes 1:1, so
+            # the binary payload survives Invoke-WebRequest's string body intact.
+            $chunk = 6MB; $stream = [IO.File]::OpenRead("$work/payload.bin")
+            try {
+                $buf = New-Object byte[] $chunk; $ids = @(); $i = 1
+                while (($read = $stream.Read($buf, 0, $chunk)) -gt 0) {
+                    $id = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{0:D6}' -f $i)); $ids += $id
+                    $slice = if ($read -lt $chunk) { $buf[0..($read-1)] } else { $buf }
+                    $body = [Text.Encoding]::GetEncoding('iso-8859-1').GetString($slice)
+                    Invoke-WebRequest -Uri "$sas&comp=block&blockid=$([Uri]::EscapeDataString($id))" -Method PUT `
+                        -Headers @{ 'x-ms-blob-type'='BlockBlob'; 'content-type'='text/plain; charset=iso-8859-1' } `
+                        -Body $body -UseBasicParsing | Out-Null
+                    $i++
+                }
+            } finally { $stream.Dispose() }
+            $xml = '<?xml version="1.0" encoding="utf-8"?><BlockList>' + (($ids | ForEach-Object { "<Latest>$_</Latest>" }) -join '') + '</BlockList>'
+            Invoke-RestMethod -Uri "$sas&comp=blocklist" -Method PUT -Headers @{ 'content-type'='text/plain; charset=UTF-8' } -Body $xml | Out-Null
+
+            $commit = @{ fileEncryptionInfo = @{
+                encryptionKey=$enc.EncryptionKey; macKey=$enc.MacKey; initializationVector=$enc.InitializationVector
+                mac=$enc.Mac; profileIdentifier=$enc.ProfileIdentifier
+                fileDigest=$enc.FileDigest; fileDigestAlgorithm=$enc.FileDigestAlgorithm } } | ConvertTo-Json -Depth 10
+            Invoke-RestMethod -Uri "$fileUrl/commit" -Headers $h -Method POST -Body $commit | Out-Null
+
+            $deadline = (Get-Date).AddMinutes(20); $ok = $false
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep 5
+                $f = Invoke-RestMethod -Uri $fileUrl -Headers $h
+                if ($f.uploadState -eq 'commitFileSuccess') { $ok = $true; break }
+                if ($f.uploadState -like '*Failed*') { throw "Commit failed: $($f.uploadState)" }
+            }
+            if (-not $ok) { throw "Timed out waiting for commitFileSuccess" }
+
+            # ── Step 9: point the app at the committed content version.
+            Invoke-RestMethod -Uri "$graphBase/deviceAppManagement/mobileApps/$appId" -Headers $h -Method PATCH `
+                -Body (@{ '@odata.type'='#microsoft.graph.win32LobApp'; committedContentVersion="$($cv.id)" } | ConvertTo-Json) | Out-Null
+
+            # ── Step 10: assign to a device group. This is the ONLY targeting MDM
+            #    does — deliver the pipe to enrolled devices. No app catalog here.
+            $groupId = '${{ parameters.assignmentGroupId }}'
+            $assign = @{ mobileAppAssignments = @(@{
+                '@odata.type' = '#microsoft.graph.mobileAppAssignment'
+                intent        = 'required'
+                target        = @{ '@odata.type'='#microsoft.graph.groupAssignmentTarget'; groupId=$groupId }
+                settings      = @{ '@odata.type'='#microsoft.graph.win32LobAppAssignmentSettings'
+                                   notifications='hideAll'; deliveryOptimizationPriority='foreground' }
+            }) } | ConvertTo-Json -Depth 20
+            Invoke-RestMethod -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/assign" -Headers $h -Method POST -Body $assign | Out-Null
+            Write-Host "Assigned $displayName ($appId) to group $groupId — done."

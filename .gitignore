@@ -1,0 +1,22 @@
+.DS_Store
+Thumbs.db
+
+# Cimian / Intune build artifacts
+*.intunewin
+*.nupkg
+build/
+**/build/
+
+# .NET build output
+bin/
+obj/
+
+# Node listeners
+node_modules/
+npm-debug.log*
+
+# Local secrets — never commit
+*.pfx
+*.cer
+*.env
+*.env.*

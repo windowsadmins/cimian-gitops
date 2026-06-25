@@ -1,0 +1,11 @@
+{
+  "name": "cimian-commits-listener",
+  "version": "2025.04.16",
+  "private": true,
+  "type": "module",
+  "description": "AWS SQS listener that refreshes a Windows Cimian caching server.",
+  "main": "sqs-listener.js",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.600.0"
+  }
+}

@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+exec pwsh -NoProfile -File "$(dirname "$0")/post-rewrite.ps1" "$@"

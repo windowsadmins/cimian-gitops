@@ -1,0 +1,66 @@
+name: Cimian Deploy (AWS S3 + CloudFront)
+
+on:
+  push:
+    branches: [main]
+    paths:   ['deployment/**']
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    env:
+      S3_BUCKET:  ${{ secrets.S3_BUCKET }}
+      DIST_ID:    ${{ secrets.CLOUDFRONT_DIST }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          deployment
+          pipelines
+        fetch-depth: 1
+
+    - name: Configure AWS creds
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region:            ${{ env.AWS_REGION }}
+
+    - name: Install Cimian makecatalogs
+      shell: pwsh
+      run: |
+        Invoke-WebRequest -UseBasicParsing `
+          -Uri 'https://github.com/windowsadmins/cimian/releases/latest/download/makecatalogs.exe' `
+          -OutFile "$env:RUNNER_TEMP\makecatalogs.exe"
+
+    - name: Build catalogs
+      shell: pwsh
+      run: |
+        & "$env:RUNNER_TEMP\makecatalogs.exe" "${{ github.workspace }}\deployment"
+        if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+
+    - name: Clean temp chunks
+      shell: pwsh
+      run: |
+        Get-ChildItem deployment/pkgs -Recurse -File `
+          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
+          Remove-Item -Force
+
+    - name: Sync catalogs to S3
+      shell: pwsh
+      run: |
+        aws s3 sync deployment/catalogs  s3://$env:S3_BUCKET/deployment/catalogs  --delete
+
+    - name: Sync manifests + pkgsinfo
+      shell: pwsh
+      run: |
+        aws s3 sync deployment/manifests s3://$env:S3_BUCKET/deployment/manifests --delete
+        aws s3 sync deployment/pkgsinfo  s3://$env:S3_BUCKET/deployment/pkgsinfo  --delete
+
+    - name: Invalidate CloudFront
+      shell: pwsh
+      run: |
+        aws cloudfront create-invalidation --distribution-id "$env:DIST_ID" --paths "/*"

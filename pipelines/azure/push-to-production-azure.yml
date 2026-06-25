@@ -1,0 +1,102 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  push-to-production-azure.yml — sync the Cimian deployment tree to Azure Blob.
+#
+#  This is the Cimian companion to munki-gitops' azure/push-to-production-azure.yml.
+#  On every commit that touches deployment/** it rebuilds the catalogs, then mirrors
+#  deployment/{catalogs,manifests,pkgsinfo} to Azure Blob storage with azcopy and
+#  purges the Front Door edge cache so clients see the change immediately.
+#
+#  Packages themselves (.nupkg / .msi / .exe) are committed under deployment/pkgs
+#  and synced separately/out-of-band; this pipeline only ships the metadata that
+#  managedsoftwareupdate reads. Every name below is a placeholder — swap the
+#  variables block for yours and it runs.
+# ──────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - /deployment/**
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  - group: cimian-repo-secrets            # contains SAS token + connection IDs
+  - name: AZ_STORAGE_URL                  # e.g. https://<storage-account>.blob.core.windows.net/repo
+    value: '<blob-url-with-SAS>'
+  - name: FDO_ENDPOINT_NAME               # Front Door endpoint
+    value: '<frontdoor-endpoint>'
+  - name: azureServiceConnection
+    value: '<ADO-service-connection>'
+  - name: REPO_PATH
+    value: '/deployment'
+  - name: MAKECATALOGS_PATH
+    value: '$(Build.ArtifactStagingDirectory)/makecatalogs.exe'
+
+stages:
+- stage: PushCimianRepo
+  jobs:
+  - job: CloudDeploy
+    steps:
+    - checkout: self
+      clean: true
+      persistCredentials: true
+
+    - pwsh: |
+        git sparse-checkout init --cone
+        git sparse-checkout set deployment pipelines
+      displayName: Sparse checkout
+
+    - pwsh: |
+        # Fetch the makecatalogs binary from the public windowsadmins/cimian release.
+        # Substitute an Azure Artifacts UniversalPackages@0 download if you publish
+        # makecatalogs to an internal feed instead.
+        $tag = 'latest'
+        $rel = if ($tag -eq 'latest') { 'latest/download' } else { "download/$tag" }
+        $url = "https://github.com/windowsadmins/cimian/releases/$rel/makecatalogs.exe"
+        Write-Host "Downloading $url"
+        Invoke-WebRequest -Uri $url -OutFile "$(MAKECATALOGS_PATH)" -UseBasicParsing
+      displayName: Install Cimian makecatalogs
+
+    - pwsh: |
+        & "$(MAKECATALOGS_PATH)" "$(Build.SourcesDirectory)$(REPO_PATH)"
+        if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+      displayName: Run makecatalogs
+
+    - pwsh: |
+        # Strip any chunked/temp package fragments before sync so only finished
+        # .nupkg / .msi / .exe artifacts ever reach the bucket.
+        Get-ChildItem "$(Build.SourcesDirectory)/deployment/pkgs" -Recurse -File `
+          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
+          Remove-Item -Force
+      displayName: Sanitize /pkgs folder
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          foreach ($d in 'catalogs','manifests','pkgsinfo') {
+            azcopy sync `
+              "$(Build.SourcesDirectory)/deployment/$d" `
+              "$(AZ_STORAGE_URL)/deployment/$d$(AZ_SAS)" `
+              --recursive --delete-destination=true
+          }
+      displayName: Sync to Azure Blob
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          az afd endpoint purge `
+            --resource-group '<resource-group>' `
+            --profile-name '<frontdoor-profile>' `
+            --endpoint-name '$(FDO_ENDPOINT_NAME)' `
+            --content-paths '/*'
+      displayName: Purge Front Door

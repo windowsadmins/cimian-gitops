@@ -1,0 +1,78 @@
+name: Cimian Deploy (Azure Blob + Front Door)
+
+on:
+  push:
+    branches: [main]
+    paths:   ['deployment/**']
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    env:
+      AZ_STORAGE_URL: ${{ secrets.AZ_STORAGE_URL }}   # container URL w/out SAS
+      AZ_SAS:        ${{ secrets.AZ_SAS_TOKEN }}      # starts with '?sv='
+      FDO_ENDPOINT:  ${{ secrets.FD_ENDPOINT }}       # <frontdoor-endpoint>
+      FDO_PROFILE:   ${{ secrets.FD_PROFILE }}
+      FDO_RG:        ${{ secrets.FD_RESOURCE_GROUP }}
+      AZ_SUBSCRIPTION: ${{ secrets.AZ_SUB }}
+      AZ_CLIENT_ID:    ${{ secrets.AZ_CLIENT_ID }}
+      AZ_TENANT_ID:    ${{ secrets.AZ_TENANT_ID }}
+      AZ_CLIENT_SECRET: ${{ secrets.AZ_CLIENT_SECRET }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          deployment
+          pipelines
+        fetch-depth: 1
+
+    - name: Install Cimian makecatalogs + azcopy
+      shell: pwsh
+      run: |
+        Invoke-WebRequest -UseBasicParsing `
+          -Uri 'https://github.com/windowsadmins/cimian/releases/latest/download/makecatalogs.exe' `
+          -OutFile "$env:RUNNER_TEMP\makecatalogs.exe"
+        choco install azcopy10 -y --no-progress
+
+    - name: Build catalogs
+      shell: pwsh
+      run: |
+        & "$env:RUNNER_TEMP\makecatalogs.exe" "${{ github.workspace }}\deployment"
+        if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+
+    - name: Clean temp chunks
+      shell: pwsh
+      run: |
+        Get-ChildItem deployment/pkgs -Recurse -File `
+          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
+          Remove-Item -Force
+
+    - name: Upload to Azure Blob (azcopy)
+      shell: pwsh
+      run: |
+        foreach ($d in 'catalogs','manifests','pkgsinfo') {
+          azcopy sync `
+            "deployment/$d" `
+            "$env:AZ_STORAGE_URL/deployment/$d$env:AZ_SAS" `
+            --recursive --delete-destination=true
+        }
+
+    - name: Azure login
+      uses: azure/login@v2
+      with:
+        creds: >-
+          {"clientId":"${{ env.AZ_CLIENT_ID }}",
+           "clientSecret":"${{ env.AZ_CLIENT_SECRET }}",
+           "subscriptionId":"${{ env.AZ_SUBSCRIPTION }}",
+           "tenantId":"${{ env.AZ_TENANT_ID }}"}
+
+    - name: Purge Front Door cache
+      shell: pwsh
+      run: |
+        az afd endpoint purge `
+          --resource-group "$env:FDO_RG" `
+          --profile-name "$env:FDO_PROFILE" `
+          --endpoint-name "$env:FDO_ENDPOINT" `
+          --content-paths '/*'

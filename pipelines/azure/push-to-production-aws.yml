@@ -1,0 +1,107 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  push-to-production-aws.yml — sync the Cimian deployment tree to AWS S3.
+#
+#  Same flow as push-to-production-azure.yml, but the cloud backend is S3 +
+#  CloudFront instead of Azure Blob + Front Door. Runs on an Azure DevOps Windows
+#  agent so the Cimian makecatalogs binary runs natively. Every name below is a
+#  placeholder.
+# ──────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - /deployment/**
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  - group: cimian-repo-secrets
+  - name: S3_BUCKET_NAME       # e.g. cimian-prod-bucket
+    value: '<your-bucket>'
+  - name: AWS_DISTRIBUTION_ID  # CloudFront distribution
+    value: '<E123ABCXYZ>'
+  - name: REPO_PATH
+    value: '/deployment'
+  - name: MAKECATALOGS_PATH
+    value: '$(Build.ArtifactStagingDirectory)/makecatalogs.exe'
+
+stages:
+- stage: PushCimianRepo
+  jobs:
+  - job: CloudDeploy
+    steps:
+    - checkout: self
+      clean: true
+      persistCredentials: true
+
+    - pwsh: |
+        git sparse-checkout init --cone
+        git sparse-checkout set deployment pipelines
+      displayName: Sparse checkout
+
+    - pwsh: |
+        # Fetch the makecatalogs binary from the public windowsadmins/cimian release.
+        $tag = 'latest'
+        $rel = if ($tag -eq 'latest') { 'latest/download' } else { "download/$tag" }
+        $url = "https://github.com/windowsadmins/cimian/releases/$rel/makecatalogs.exe"
+        Write-Host "Downloading $url"
+        Invoke-WebRequest -Uri $url -OutFile "$(MAKECATALOGS_PATH)" -UseBasicParsing
+      displayName: Install Cimian makecatalogs
+
+    - pwsh: |
+        & "$(MAKECATALOGS_PATH)" "$(Build.SourcesDirectory)$(REPO_PATH)"
+        if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+      displayName: Run makecatalogs
+
+    - pwsh: |
+        Get-ChildItem "$(Build.SourcesDirectory)/deployment/pkgs" -Recurse -File `
+          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
+          Remove-Item -Force
+      displayName: Sanitize /pkgs folder
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: ca-central-1
+        awsCommand: s3
+        awsSubCommand: sync
+        awsArguments: |
+          $(Build.SourcesDirectory)/deployment/catalogs `
+          s3://$(S3_BUCKET_NAME)/deployment/catalogs --delete
+      displayName: Sync catalogs
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: ca-central-1
+        awsCommand: s3
+        awsSubCommand: sync
+        awsArguments: |
+          $(Build.SourcesDirectory)/deployment/manifests `
+          s3://$(S3_BUCKET_NAME)/deployment/manifests --delete
+      displayName: Sync manifests
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: ca-central-1
+        awsCommand: s3
+        awsSubCommand: sync
+        awsArguments: |
+          $(Build.SourcesDirectory)/deployment/pkgsinfo `
+          s3://$(S3_BUCKET_NAME)/deployment/pkgsinfo --delete
+      displayName: Sync pkgsinfo
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: us-east-1
+        awsCommand: cloudfront
+        awsSubCommand: create-invalidation
+        awsArguments: |
+          --distribution-id $(AWS_DISTRIBUTION_ID) --paths "/*"
+      displayName: Invalidate CloudFront

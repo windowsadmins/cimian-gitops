@@ -1,0 +1,33 @@
+# Every multi-user / lab device. Maps to Devices-Shared.
+name: Shared
+catalogs:
+- Production
+
+managed_installs:
+- Chrome
+- Firefox
+
+conditional_items:
+- condition: os_vers_major >= 11
+  managed_installs:
+  - ExampleAppNeedingWindows11
+  managed_profiles:
+  - ModernOSPrefs
+
+- condition: hostname BEGINSWITH "DESIGN"
+  managed_profiles:
+  - DesignLabPrefs
+
+managed_apps:
+- Company Portal
+
+managed_profiles:
+- DisableCopilot
+- HideLockScreenClock
+- SharedWindowsUpdateRing
+
+managed_scripts:
+- ClearSoftwareCaches
+
+included_manifests:
+- CoreManifest

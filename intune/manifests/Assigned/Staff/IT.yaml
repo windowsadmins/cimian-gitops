@@ -1,0 +1,10 @@
+# Maps to Devices-Assigned-Staff-IT.
+name: IT
+managed_installs:
+- ExampleAdminTools
+
+managed_profiles:
+- EnableRemoteDesktop
+
+managed_apps:
+- Windows Terminal

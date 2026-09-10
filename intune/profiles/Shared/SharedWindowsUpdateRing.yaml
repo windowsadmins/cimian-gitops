@@ -1,0 +1,34 @@
+# A Settings Catalog profile authored as YAML -- a "pseudo-mobileconfig",
+# modelled on the macOS .mobileconfig idea so both platforms author policy the
+# same way in the same kind of file.
+#
+# Assignments are group NAMES; the pipeline resolves them to ids at deploy time.
+displayName: "Windows Update Ring - Shared"
+description: "Deferred quality and feature updates for shared and lab PCs. Excludes kiosks."
+identifier: "com.example.gitops.SharedWindowsUpdateRing"
+platform: windows10
+technologies: "mdm"
+version: "2026.09.10"
+roleScopeTagIds:
+  - 0
+
+applicability:
+  osEditions: ["Windows 11 Enterprise"]
+  minVersion: "22H2"
+
+assignments:
+  include:
+    - Devices-Shared
+  exclude:
+    - Devices-Shared-Kiosk
+
+settingsCatalog:
+  - id: device_vendor_msft_policy_config_update_deferqualityupdatesperiodindays
+    kind: integer
+    value: 7
+  - id: device_vendor_msft_policy_config_update_deferfeatureupdatesperiodindays
+    kind: integer
+    value: 30
+  - id: device_vendor_msft_policy_config_update_allowautoupdate
+    kind: choice
+    value: device_vendor_msft_policy_config_update_allowautoupdate_3

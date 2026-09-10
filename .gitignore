@@ -20,3 +20,8 @@ npm-debug.log*
 *.cer
 *.env
 *.env.*
+
+out/
+.cache/
+__pycache__/
+*.pyc

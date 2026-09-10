@@ -1,0 +1,18 @@
+# Maps to Devices-Shared-Curriculum-Design.
+#
+# managed_uninstalls here becomes an exclusion target: this group opts out of a
+# profile it would otherwise inherit from Devices-Shared. An exclusion is only
+# meaningful when its group is a strict descendant of a group the profile
+# actually reaches -- anything else is inert and gets logged, not sent.
+name: Design
+managed_installs:
+- ExampleDesignSuite
+
+managed_uninstalls:
+- SharedWindowsUpdateRing
+
+managed_profiles:
+- EnableColorManagement
+
+managed_apps:
+- Company Portal

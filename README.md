@@ -35,6 +35,9 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | `pipelines/github/` | The same pipelines as GitHub Actions workflows. |
 | `preflight/cimian/` | A cimipkg sample that installs a Cimian preflight script run before each check. |
 | `local-caching/` | Service Bus / SQS commit-listener packages that keep on-prem caching servers in sync. |
+| `inventory/` | The twelve-column device contract, a sample fleet, and the projection script that narrows it per system. |
+| `enrollment/` | One consumer per downstream system. The Intune one builds the Entra group ladder everything else addresses. |
+| `intune/` | Renders three manifest keys the client ignores into Intune: Store apps, Settings Catalog and OMA-URI profiles, remediation scripts. |
 
 ## Git hooks at a glance
 
@@ -50,6 +53,48 @@ git config core.hooksPath githooks/aws
 
 They validate Cimian pkgsinfo with `makecatalogs`, auto-download missing `.nupkg`/`.msi`/`.exe` from cloud storage, lint for structural errors `makecatalogs` lets through, and sync the repo to Azure Blob or S3 on push — with size guards, concurrency locks, capped orphan cleanup, and a version floor. See [`githooks/README.md`](githooks/README.md) for the full reference and the `CIMIAN_*` environment variables.
 
+## Inventory, groups and manifests
+
+Four inventory columns — `usage`, `catalog`, `area`, `location` — are one
+hierarchy. At enrollment they become five nested Entra groups. Cimian manifests
+live in a directory tree built from the same columns. So:
+
+```
+manifests/Assigned/Staff/IT.yaml   <->   Devices-Assigned-Staff-IT
+```
+
+A manifest path and a group name are the same address written twice, and both
+derive from the same row, so they cannot drift.
+
+Which means a manifest can carry keys Cimian ignores and have them mean
+something:
+
+| Key | Renders to |
+|---|---|
+| `managed_apps` | Microsoft Store apps |
+| `managed_profiles` | Settings Catalog and OMA-URI profiles |
+| `managed_scripts` | Remediation scripts |
+
+One reviewed file describes what the agent does *and* what MDM does.
+
+**Try it offline.** No tenant, no credentials, PyYAML the only dependency:
+
+```
+python3 inventory/projections/project.py inventory/inventory.csv --out-dir out/
+cd enrollment && python3 -m consumers.intune ../out/intune.csv --what-if
+cd ../intune && python3 -m stages.lint_conditions manifests/
+python3 -m stages.plan_assignments manifests/
+```
+
+With no `GRAPH_TOKEN` the Intune consumer prints the group plan and stops. Run
+that first, before handing it anything.
+
+**Guards.** Adding is safe; removing is not. A degraded parse yields an *empty*
+desired set rather than an error — a well-formed answer that removes everything
+on a green build. So there is a floor on the desired set, a cap on how much one
+run may remove, ownership markers so only this pipeline's own objects are
+touched, and `whatIf` as a supported way to run.
+
 ## Cimian vs Munki
 
 Same architecture, different platform specifics:
@@ -57,6 +102,9 @@ Same architecture, different platform specifics:
 - Packages are `.nupkg` / `.msi` / `.exe`, architecture `x64`, built with [`cimipkg`](https://github.com/windowsadmins/cimian-pkg).
 - Hooks are PowerShell (a small POSIX shim execs `pwsh` on the `.ps1`), so they run from Git Bash, WSL, or any `sh` Git ships on Windows.
 - `makecatalogs` emits a slightly different missing-installer warning; the hooks and the superseded resolver handle both dialects.
+- One condition genuinely differs. `machine_type == "laptop"` translates on macOS because Apple's marketing names carry the form factor, so it maps to a model-name prefix. Windows has no equivalent — "Surface Laptop" and "Surface Studio" share a prefix — so form factor comes from `deviceCategory`, and the linter says so rather than emitting a filter that would quietly match the wrong machines.
+
+The macOS half of the same pattern is [munki-gitops](https://github.com/rodchristiansen/munki-gitops).
 
 ## Talk
 

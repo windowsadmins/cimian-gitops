@@ -1,0 +1,17 @@
+# An OMA-URI custom profile: a list of CSP paths and typed values. The other
+# shape a Windows profile takes in this kit.
+displayName: "DisableCopilot"
+description: "Turns off Windows Copilot on shared devices."
+identifier: "com.example.gitops.DisableCopilot"
+platform: windows10
+version: "2026.09.10"
+
+assignments:
+  include:
+    - Devices-Shared
+
+omaSettings:
+  - displayName: "Turn off Windows Copilot"
+    omaUri: "./User/Vendor/MSFT/Policy/Config/WindowsAI/TurnOffWindowsCopilot"
+    dataType: integer
+    value: 1

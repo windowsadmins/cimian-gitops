@@ -1,0 +1,33 @@
+# Every 1:1 device. Maps to Devices-Assigned.
+#
+# The first keys are Cimian's and Cimian acts on them. managed_apps,
+# managed_profiles and managed_scripts are read only by this kit's pipeline and
+# ignored by the client, which is what lets one reviewed file describe both what
+# the agent does and what MDM does.
+name: Assigned
+catalogs:
+- Production
+
+managed_installs:
+- Chrome
+- Firefox
+
+managed_uninstalls:
+- OldSecurityAgent
+
+managed_updates:
+- Chrome
+- Firefox
+
+managed_apps:
+- Company Portal
+
+managed_profiles:
+- AssignedEdgePrefs
+- AssignedWindowsUpdateRing
+
+managed_scripts:
+- RemediateAgentOwnership
+
+included_manifests:
+- CoreManifest

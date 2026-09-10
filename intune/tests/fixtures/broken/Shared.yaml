@@ -1,0 +1,33 @@
+# Every rule the linter enforces, one manifest. Used by the test suite; this is
+# what a build failure is supposed to look like.
+name: Shared
+conditional_items:
+
+# Rule 1 -- no filter equivalent.
+- condition: arch == "arm64"
+  managed_profiles:
+  - ArmPrefs
+
+# Rule 1 -- looks supported on macOS, is not expressible on Windows at all:
+# there is no reliable form-factor property. Set deviceCategory instead.
+- condition: machine_type == "laptop"
+  managed_profiles:
+  - LaptopPowerPrefs
+
+# Rule 1 -- filter `model` is the marketing name, not the identifier.
+- condition: machine_model == "Surface Laptop 5"
+  managed_profiles:
+  - SpecificHardwarePrefs
+
+# Rule 2 -- malformed.
+- condition: os_vers_major >=
+  managed_profiles:
+  - BrokenPrefs
+
+# Rule 3 -- managed_apps under a condition is never read.
+- condition: os_vers_major >= 11
+  managed_apps:
+  - Company Portal
+
+managed_profiles:
+- DisableCopilot

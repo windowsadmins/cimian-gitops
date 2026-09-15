@@ -12,6 +12,7 @@ trigger:
     include:
       - intune/manifests/**
       - intune/profiles/**
+      - pkgsinfo/apps/managed/**
 
 parameters:
   - name: whatIf
@@ -59,6 +60,20 @@ stages:
           - script: python3 tests/test_intune.py
             workingDirectory: intune
             displayName: 'Assignment and translation guards'
+          - script: |
+              python3 - <<'PY'
+              import pathlib
+              import yaml
+
+              waterfall = ["Development", "Testing", "Staging", "Production"]
+              paths = list(pathlib.Path("intune/profiles").rglob("*.yaml"))
+              paths += list(pathlib.Path("pkgsinfo/apps/managed").rglob("*.yaml"))
+              for path in paths:
+                  catalogs = (yaml.safe_load(path.read_text()) or {}).get("catalogs") or []
+                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                      raise SystemExit(f"{path}: catalogs must be a cumulative waterfall prefix")
+              PY
+            displayName: 'Catalog declarations are cumulative'
           - script: python3 tests/test_group_ladder.py
             workingDirectory: enrollment
             displayName: 'Group membership guards'

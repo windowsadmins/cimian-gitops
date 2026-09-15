@@ -5,6 +5,7 @@ description: "Turns off Windows Copilot on shared devices."
 identifier: "com.example.gitops.DisableCopilot"
 platform: windows10
 version: "2026.09.10"
+catalogs: [Development, Testing, Staging, Production]
 
 assignments:
   include:

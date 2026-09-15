@@ -1,4 +1,4 @@
-# Running Cimian under a DevOps model
+# Running Cimian under a GitOps model
 
 Samples for managing a Windows fleet with [Cimian](https://github.com/windowsadmins/cimian) — the Windows-native managed-software tool modelled on [Munki](https://github.com/munki/munki) — entirely from Git: hooks, CI/CD pipelines, message queues, and local caching servers. This is the Windows companion to [munki-gitops](https://github.com/rodchristiansen/munki-gitops); the two repos mirror each other so a shop running both fleets uses one mental model.
 
@@ -15,7 +15,7 @@ That split is what makes the whole fleet reproducible from Git:
 
 The pipeline that publishes that pipe is the centerpiece here: [`pipelines/azure/bootstrap-to-intune.yml`](pipelines/azure/bootstrap-to-intune.yml) (and its GitHub Actions / S3 twin at [`pipelines/github/bootstrap-to-intune.yml`](pipelines/github/bootstrap-to-intune.yml)). It builds and signs the BootstrapMate MSI, wraps it as an `.intunewin`, regenerates and uploads `management.json`, and pushes the Win32 LOB to Intune via Microsoft Graph with a single group assignment.
 
-## From manual to DevOps
+## From manual to GitOps
 
 The legacy flow was a shared admin box, one central share, many hands, no pipeline, no gates. Now:
 
@@ -37,7 +37,8 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | `local-caching/` | Service Bus / SQS commit-listener packages that keep on-prem caching servers in sync. |
 | `inventory/` | The twelve-column device contract, a sample fleet, and the projection script that narrows it per system. |
 | `enrollment/` | One consumer per downstream system. The Intune one builds the Entra group ladder everything else addresses. |
-| `intune/` | Renders three manifest keys the client ignores into Intune: Store apps, Settings Catalog and OMA-URI profiles, remediation scripts. |
+| `intune/` | Renders three manifest keys the client ignores into Intune: Store apps, Settings Catalog and OMA-URI profiles, scripts. |
+| `pkgsinfo/apps/managed/` | One YAML source-of-truth descriptor for each managed Store app. |
 
 ## Git hooks at a glance
 
@@ -73,9 +74,31 @@ something:
 |---|---|
 | `managed_apps` | Microsoft Store apps |
 | `managed_profiles` | Settings Catalog and OMA-URI profiles |
-| `managed_scripts` | Remediation scripts |
+| `managed_scripts` | PowerShell scripts |
 
 One reviewed file describes what the agent does *and* what MDM does.
+
+### Catalog-staged Intune releases
+
+Machine-manifest `catalogs` identify an endpoint's cohort. Each profile, script,
+and managed-app descriptor has a separate cumulative `catalogs` array that
+declares how far that artifact has been promoted:
+
+```yaml
+catalogs:
+- Development
+- Testing
+- Staging
+```
+
+Promotion is a reviewed edit to that array; it is never time-driven. The
+pipeline automates only the mechanics: a changed profile or script becomes a
+hash-identified candidate, the previous Production object remains assigned to
+later cohorts, and the predecessor is retired only when the source explicitly
+includes Production. Managed scripts live under `scripts/`, and Store app
+identifiers and assignment metadata live under `pkgsinfo/apps/managed/` rather
+than in the pipeline body. New release-controller logic stays inline in the
+pipeline YAML so the deployment remains self-contained.
 
 **Try it offline.** No tenant, no credentials, PyYAML the only dependency:
 

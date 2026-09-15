@@ -2219,40 +2219,29 @@ stages:
 
               $ManifestsPath = "$(Build.SourcesDirectory)\deployment\manifests"
 
-              # WinGet app definitions using modern package identifiers
-              # Name in a manifest -> what the API needs to find the app.
-              #
-              # Trimmed to two entries for this sample. The real table is a
-              # statement about what one organisation deploys, so build your own.
-              # Both the spaced and unspaced spellings are present on purpose:
-              # manifests are written by people, and "Company Portal" and
-              # "CompanyPortal" should not be two different apps.
-              $WinGetAppMappings = @{
-                  "Company Portal" = @{
-                      PackageIdentifier = "Microsoft.CompanyPortal"
-                      DisplayName       = "Company Portal"
-                      Publisher         = "Microsoft Corporation"
-                      Description       = "The Company Portal app helps you manage your corporate devices and apps."
-                      RunAs             = "system"
-                  }
-                  "CompanyPortal" = @{
-                      PackageIdentifier = "Microsoft.CompanyPortal"
-                      DisplayName       = "Company Portal"
-                      Publisher         = "Microsoft Corporation"
-                      Description       = "The Company Portal app helps you manage your corporate devices and apps."
-                      RunAs             = "system"
-                  }
-                  "Example Signage Player" = @{
-                      PackageIdentifier = "Example.SignagePlayer"
-                      DisplayName       = "Example Signage Player"
-                      Publisher         = "Example Vendor"
-                      Description       = "Digital signage and display management application."
-                      RunAs             = "system"
-                  }
-                  # Add more app mappings here as needed
-              }
-
               Import-Module powershell-yaml
+
+              $WinGetAppMappings = @{}
+              $ManagedAppsPath = "$(Build.SourcesDirectory)\pkgsinfo\apps\managed"
+              Get-ChildItem -Path $ManagedAppsPath -Filter '*.yaml' -File | ForEach-Object {
+                  $metadata = ConvertFrom-Yaml (Get-Content -Raw $_.FullName)
+                  if ($metadata.source -ne 'microsoft_store') { return }
+                  $catalogs = @($metadata.catalogs)
+                  $waterfall = @('Development', 'Testing', 'Staging', 'Production')
+                  if ($catalogs.Count -eq 0 -or ($catalogs -join '|') -ne (($waterfall[0..($catalogs.Count - 1)]) -join '|')) {
+                      throw "$($_.FullName): catalogs must be a cumulative Development-to-Production prefix"
+                  }
+                  $definition = @{
+                      PackageIdentifier = $metadata.package_identifier
+                      DisplayName       = $metadata.name
+                      Publisher         = $metadata.publisher
+                      Description       = $metadata.description
+                      RunAs             = $metadata.install.run_as
+                  }
+                  @($metadata.name) + @($metadata.aliases) | ForEach-Object {
+                      $WinGetAppMappings[$_] = $definition
+                  }
+              }
 
               # -------------------------------------------------------------------
               $global:httpClient = $null

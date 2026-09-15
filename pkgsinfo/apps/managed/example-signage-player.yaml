@@ -1,0 +1,14 @@
+name: Example Signage Player
+source: microsoft_store
+package_identifier: Example.SignagePlayer
+publisher: Example Vendor
+description: Digital signage and display management application.
+install:
+  run_as: system
+assignment:
+  intent: required
+catalogs:
+- Development
+- Testing
+- Staging
+- Production

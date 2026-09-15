@@ -1,0 +1,16 @@
+name: Company Portal
+aliases:
+- CompanyPortal
+source: microsoft_store
+package_identifier: Microsoft.CompanyPortal
+publisher: Microsoft Corporation
+description: The Company Portal app helps users manage organizational devices and apps.
+install:
+  run_as: system
+assignment:
+  intent: required
+catalogs:
+- Development
+- Testing
+- Staging
+- Production

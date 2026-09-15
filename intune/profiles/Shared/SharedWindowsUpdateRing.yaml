@@ -9,6 +9,7 @@ identifier: "com.example.gitops.SharedWindowsUpdateRing"
 platform: windows10
 technologies: "mdm"
 version: "2026.09.10"
+catalogs: [Development, Testing, Staging, Production]
 roleScopeTagIds:
   - 0
 

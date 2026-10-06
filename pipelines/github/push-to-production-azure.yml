@@ -4,7 +4,7 @@
 # .github/workflows/ in your Cimian repo.
 #
 # Auth is OpenID Connect federation: azure/login exchanges the job's GitHub
-# token for an Entra token, so there is no client secret and no SAS token to
+# token for an Entra token, so there is no client secret and no stored SAS to
 # rotate. Create a federated credential on the app registration (or user-
 # assigned managed identity) for repo:<owner>/<repo>:ref:refs/heads/main, and
 # grant it Storage Blob Data Contributor on the storage account and CDN Endpoint
@@ -80,24 +80,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not list deployment/pkgs; the identity needs Storage Blob Data Reader or better.' }
           ./pipelines/scripts/Test-PackagesPresent.ps1 -RepoPath deployment -InventoryFile $inv
 
-      # Metadata trees mirror git exactly; packages and source trees are only
-      # ever added to. azcopy reuses the az login from the step above.
+      # Sync-RepoToBlob mints a short-lived user-delegation SAS from the OIDC
+      # login and runs azcopy with it; see the script for why.
       - name: Sync to Azure Blob
         shell: pwsh
-        env:
-          AZCOPY_AUTO_LOGIN_TYPE: AZCLI
-        run: |
-          $base = "https://$env:STORAGE_ACCOUNT.blob.core.windows.net/$env:STORAGE_CONTAINER"
-          function Sync($src, $dest, [bool] $mirror) {
-            if (-not (Test-Path $src)) { Write-Host "Skipping $src (not in this repo)"; return }
-            $del = if ($mirror) { 'true' } else { 'false' }
-            azcopy sync $src "$base/$dest" --recursive --delete-destination=$del
-            if ($LASTEXITCODE -ne 0) { throw "azcopy sync $src failed ($LASTEXITCODE)" }
-          }
-          foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') { Sync "deployment/$d" "deployment/$d" $true }
-          Sync 'deployment/pkgs' 'deployment/pkgs' $false
-          Sync 'installers' 'installers' $false
-          Sync 'packages' 'packages' $false
+        run: ./pipelines/scripts/Sync-RepoToBlob.ps1 -StorageAccount $env:STORAGE_ACCOUNT -Container $env:STORAGE_CONTAINER -RepoRoot $env:GITHUB_WORKSPACE
 
       # Never purge /deployment/pkgs/*: packages are version-named and never
       # stale at the edge.

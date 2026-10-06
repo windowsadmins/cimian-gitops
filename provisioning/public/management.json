@@ -1,0 +1,28 @@
+{
+  "setupassistant": [
+    {
+      "name": "Cimian (x64)",
+      "file": "Cimian-2026.09.18.1356-x64.msi",
+      "url": "https://cimian.example.com/bootstrap/Cimian-2026.09.18.1356-x64.msi",
+      "arguments": [],
+      "type": "msi",
+      "condition": "architecture_x64"
+    },
+    {
+      "name": "Cimian (ARM64)",
+      "file": "Cimian-2026.09.18.1356-arm64.msi",
+      "url": "https://cimian.example.com/bootstrap/Cimian-2026.09.18.1356-arm64.msi",
+      "arguments": [],
+      "type": "msi",
+      "condition": "architecture_arm64"
+    },
+    {
+      "name": "Cimian preferences",
+      "file": "CimianPrefs.msi",
+      "url": "https://cimian.example.com/bootstrap/CimianPrefs.msi",
+      "arguments": [],
+      "type": "msi"
+    }
+  ],
+  "userland": []
+}

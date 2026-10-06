@@ -57,3 +57,16 @@ try {
 } finally {
     Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# Package path validation and log redaction
+foreach ($bad in '../x.msi', 'apps/../../x.msi', '..\..\x.msi', 'C:\Windows\x.msi', 'c:x.msi', '\\server\share\x.msi', '//server/x.msi', 'apps//x.msi', 'apps/./x.msi', '') {
+    Assert-True ($null -eq (ConvertTo-PkgRelativePath $bad)) "'$bad' should be rejected"
+}
+Assert-True ((ConvertTo-PkgRelativePath '/apps/x.msi') -eq 'apps/x.msi') 'a leading slash means under pkgs'
+Assert-True ((ConvertTo-PkgRelativePath 'deployment\pkgs\apps\x.msi') -eq 'apps/x.msi') 'a deployment/pkgs prefix is dropped'
+$pk = Join-Path ([IO.Path]::GetTempPath()) 'pk-root'
+Assert-True ($null -ne (Resolve-PkgLocalPath -PkgsDir $pk -RelPath 'apps/x.msi')) 'an in-root path resolves'
+Assert-True ($null -eq (Resolve-PkgLocalPath -PkgsDir $pk -RelPath '../pk-root-evil/x.msi')) 'a sibling prefix must not resolve'
+$red = Hide-UrlSecret 'https://acct.blob.core.windows.net/c/x?sv=2022&sig=abc%2Fdef&se=2030 and https://b.s3.amazonaws.com/k?X-Amz-Signature=ff&X-Amz-Credential=AK'
+Assert-True ($red -notmatch 'abc%2Fdef|=ff|=AK') "secrets should be redacted: $red"
+Write-Host 'PASS: path validation and redaction'

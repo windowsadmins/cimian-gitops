@@ -202,10 +202,14 @@ function Get-InstallerLocation {
     $content = Get-Content $PkgsInfoFile -Raw -ErrorAction SilentlyContinue
     if (-not $content) { return '' }
     if ($content -match '(?m)^\s+location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-        return ($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')
+        $rel = ConvertTo-PkgRelativePath $Matches[1]
+        if (-not $rel) { Write-Log "WARNING: ignoring unsafe installer location '$($Matches[1])' in $PkgsInfoFile"; return '' }
+        return $rel
     }
     if ($content -match '(?m)^installer_item_location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-        return ($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')
+        $rel = ConvertTo-PkgRelativePath $Matches[1]
+        if (-not $rel) { Write-Log "WARNING: ignoring unsafe installer location '$($Matches[1])' in $PkgsInfoFile"; return '' }
+        return $rel
     }
     return ''
 }
@@ -261,7 +265,7 @@ function Remove-OrphanPackage {
     }
     foreach ($o in $orphans) {
         Write-Log "  orphan: $o"
-        if (-not $DryRun) { Remove-Item (Join-Path $PkgsDir ($o -replace '/', '\')) -Force -ErrorAction SilentlyContinue }
+        if (-not $DryRun) { $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $o; if ($lp) { Remove-Item -LiteralPath $lp -Force -ErrorAction SilentlyContinue } }
     }
     Write-Log "Cleaned up $($orphans.Count) orphan package(s)"
 }
@@ -282,9 +286,11 @@ function Invoke-CacheFirstDownload {
     $azureBatch = [System.IO.Path]::GetTempFileName()
     $total = 0; $cacheHits = 0; $batchCount = 0
     foreach ($rel in $RelPaths) {
-        if (-not $rel) { continue }
+        $rel = ConvertTo-PkgRelativePath $rel
+        if (-not $rel) { Write-Log '  WARNING: skipping an unsafe package path'; continue }
+        $dest = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $rel
+        if (-not $dest) { Write-Log "  WARNING: $rel resolves outside deployment/pkgs, skipping"; continue }
         $total++
-        $dest = Join-Path $PkgsDir ($rel -replace '/', '\')
         $parent = Split-Path -Parent $dest
         if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
 
@@ -314,7 +320,7 @@ function Invoke-CacheFirstDownload {
             "--list-of-files=$azureBatch" --as-subdir=false `
             --overwrite=ifSourceNewer --log-level=ERROR --output-level=essential 2>&1
         $code = $LASTEXITCODE
-        Add-Content -Path $LogFile -Value ($out | Out-String)
+        Add-Content -Path $LogFile -Value (Hide-UrlSecret ($out | Out-String))
 
         if ($code -ne 0) {
             if ("$out" -match '(AADSTS|Failed to perform Auto-login|refresh token has expired)') {
@@ -329,7 +335,7 @@ function Invoke-CacheFirstDownload {
                     "--list-of-files=$azureBatch" --as-subdir=false `
                     --overwrite=ifSourceNewer --log-level=ERROR --output-level=essential 2>&1
                 $code = $LASTEXITCODE
-                Add-Content -Path $LogFile -Value ($out | Out-String)
+                Add-Content -Path $LogFile -Value (Hide-UrlSecret ($out | Out-String))
                 if ($code -ne 0) { Write-Log "  WARNING: batch azcopy exited $code after re-auth" }
             } else {
                 Write-Log "  WARNING: batch azcopy exited $code — some files may not exist in Azure"
@@ -435,7 +441,7 @@ if ($changedPaths -eq 'force') {
         Write-Log ">> force downloading deployment/$sub"
         & $AzCopyExe sync "$StorageUrl/deployment/$sub/" (Join-Path $Deployment $sub) `
             --delete-destination=true --exclude-pattern='.DS_Store;._*' --log-level=INFO 2>&1 |
-            ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     }
     Complete-Log
     exit 0
@@ -457,7 +463,7 @@ if ($changedPaths -eq 'sync') {
     foreach ($sub in @('catalogs', 'pkgs', 'icons')) {
         Write-Log ">> syncing deployment/$sub"
         & $AzCopyExe sync "$StorageUrl/deployment/$sub/" (Join-Path $Deployment $sub) @syncOpts 2>&1 |
-            ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     }
     Complete-Log
     exit 0
@@ -471,14 +477,14 @@ if ($changedPaths -match 'catalogs') {
     Write-Log '>> syncing deployment/catalogs'
     & $AzCopyExe sync "$StorageUrl/deployment/catalogs/" (Join-Path $Deployment 'catalogs') `
         --exclude-pattern='.DS_Store;._*' --log-level=ERROR --output-level=essential 2>&1 |
-        ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+        ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
 }
 
 if ($changedPaths -match 'icons') {
     Write-Log '>> syncing deployment/icons'
     & $AzCopyExe sync "$StorageUrl/deployment/icons/" (Join-Path $Deployment 'icons') `
         --exclude-pattern='.DS_Store;._*' --log-level=ERROR --output-level=essential 2>&1 |
-        ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+        ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
 }
 
 if ($changedPaths -match 'pkgsinfo' -and $changedPkgsInfo.Count -gt 0) {

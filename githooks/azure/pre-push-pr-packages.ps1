@@ -216,12 +216,19 @@ foreach ($relativePkgsInfo in $pkgsInfoFiles) {
         continue
     }
 
-    $location = $metadata.Location -replace '^deployment/pkgs/', '' -replace '^pkgs/', ''
-    $packageRelativePath = "deployment/pkgs/$location" -replace '/', [IO.Path]::DirectorySeparatorChar
-    $localPath = Join-Path $repoRoot $packageRelativePath
+    # The location is commit data: validate it before it becomes a local path
+    # or a storage key, so `..` or an absolute path cannot escape deployment/pkgs.
+    $location = ConvertTo-PkgRelativePath $metadata.Location
+    if (-not $location) {
+        Write-Host "ERROR: $relativePkgsInfo has an unsafe installer location '$($metadata.Location)' (absolute, drive, UNC or '..')." -ForegroundColor Red
+        $failures++
+        continue
+    }
+    $localPath = Resolve-PkgLocalPath -PkgsDir (Join-Path (Join-Path $repoRoot 'deployment') 'pkgs') -RelPath $location
+    if (-not $localPath) { Write-Host "ERROR: $location resolves outside deployment/pkgs." -ForegroundColor Red; $failures++; continue }
     if (-not (Test-Path -LiteralPath $localPath -PathType Leaf) -and $primaryRoot -ne $repoRoot) {
-        $primaryPath = Join-Path $primaryRoot $packageRelativePath
-        if (Test-Path -LiteralPath $primaryPath -PathType Leaf) { $localPath = $primaryPath }
+        $primaryPath = Resolve-PkgLocalPath -PkgsDir (Join-Path (Join-Path $primaryRoot 'deployment') 'pkgs') -RelPath $location
+        if ($primaryPath -and (Test-Path -LiteralPath $primaryPath -PathType Leaf)) { $localPath = $primaryPath }
     }
     $blobPath = "deployment/pkgs/$location"
 

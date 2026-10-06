@@ -615,3 +615,81 @@ function Invoke-CategoryGate {
     }
     return $true
 }
+
+# ── package path validation ─────────────────────────────────────────────────
+# A pkgsinfo `location:` is data from a commit, and the hooks turn it into a
+# local file path and a blob or object key. Without a check, `..\..\` or an
+# absolute path would read or write outside deployment/pkgs, or name an
+# arbitrary key in the bucket. Every location goes through these two before it
+# is used.
+#
+# ConvertTo-PkgRelativePath returns the location as a forward-slash path
+# relative to deployment/pkgs, or $null when it is not one: a drive letter, a
+# UNC or other absolute path, any `..` or empty segment, or control
+# characters. One leading slash is accepted, because Cimian writes locations
+# as `/apps/Thing.msi` meaning "under pkgs". A `deployment/pkgs/` or `pkgs/`
+# prefix is dropped.
+function ConvertTo-PkgRelativePath {
+    param([AllowNull()] [string]$Location)
+    if ([string]::IsNullOrWhiteSpace($Location)) { return $null }
+    $loc = $Location.Trim().Trim("'").Trim('"')
+    if ($loc -match '[\x00-\x1f]') { return $null }
+    if ($loc -match '^[A-Za-z]:') { return $null }
+    if ($loc -match '^(\\\\|//|\\/|/\\)') { return $null }
+    $loc = $loc -replace '\\', '/'
+    if ($loc.StartsWith('/')) { $loc = $loc.Substring(1) }
+    $loc = $loc -replace '^deployment/pkgs/', '' -replace '^pkgs/', ''
+    if (-not $loc) { return $null }
+    foreach ($segment in $loc.Split('/')) {
+        if ($segment -eq '' -or $segment -eq '..' -or $segment -eq '.') { return $null }
+        if ($segment -match ':') { return $null }
+    }
+    return $loc
+}
+
+# The full local path for a validated relative path, or $null if it would
+# land outside $PkgsDir once resolved.
+function Resolve-PkgLocalPath {
+    param([Parameter(Mandatory)] [string]$PkgsDir, [AllowNull()] [string]$RelPath)
+    $rel = ConvertTo-PkgRelativePath $RelPath
+    if (-not $rel) { return $null }
+    $root = [IO.Path]::GetFullPath($PkgsDir).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $full = [IO.Path]::GetFullPath((Join-Path $root ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)))
+    $prefix = $root + [IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    return $full
+}
+
+# Every package location referenced by tracked pkgsinfo (installer and
+# uninstaller), validated. Untracked or ignored pkgsinfo do not count, so a
+# stray local file cannot widen what gets uploaded.
+function Get-TrackedPkgLocation {
+    param([Parameter(Mandatory)] [string]$RepoRoot)
+    $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $files = @(git -C $RepoRoot ls-files -- 'deployment/pkgsinfo/*.yaml' 'deployment/pkgsinfo/*.yml' 2>$null)
+    foreach ($f in $files) {
+        $path = Join-Path $RepoRoot ($f -replace '/', [IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $content = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+        if (-not $content) { continue }
+        foreach ($m in [regex]::Matches($content, '(?m)^\s+location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$')) {
+            $rel = ConvertTo-PkgRelativePath $m.Groups[1].Value
+            if ($rel) { [void]$set.Add($rel) } else { Write-Host "WARNING: ignoring unsafe package location '$($m.Groups[1].Value)' in $f" }
+        }
+    }
+    return @($set | Sort-Object)
+}
+
+# ── what never leaves the machine ───────────────────────────────────────────
+# Payload trees are synced as a whole, so these are excluded from every
+# upload: sidecars, and anything that looks like a credential or key.
+$script:UploadDenyPatterns = @('.DS_Store', '._*', '.env', '.env.*', '*.pem', '*.key', '*.pfx', '*.p12', '*.kdbx', 'id_rsa*', 'id_ed25519*', '*.ppk')
+$script:IconPatterns = @('*.png', '*.ico', '*.jpg', '*.jpeg', '*.svg', '*.webp', '*.gif')
+
+# Strip signatures and credentials from anything about to be logged: SAS
+# query parameters and AWS presigned-URL parameters.
+function Hide-UrlSecret {
+    param([AllowNull()] $Text)
+    if ($null -eq $Text) { return $Text }
+    return ([string]$Text) -replace '(?i)([?&](sig|se|st|sp|spr|sv|sr|sip|skoid|sktid|skt|ske|sks|skv|x-amz-signature|x-amz-credential|x-amz-security-token)=)[^&\s"'']+', '$1***'
+}

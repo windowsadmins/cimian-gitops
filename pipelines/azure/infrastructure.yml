@@ -1,13 +1,19 @@
 # ──────────────────────────────────────────────────────────────────────────────
-#  infrastructure.yml — plan and apply ../../infrastructure with Terraform.
+#  infrastructure.yml — check and apply ../../infrastructure with Terraform.
 #
-#  Plan runs on every change. Apply runs only from main, through a deployment
-#  job on the "cimian-infrastructure" environment: add an Approvals check to
-#  that environment (Pipelines > Environments) and the apply waits for a person
-#  to read the plan. The apply uses the exact plan file the Plan stage saved.
+#  Two stages, split by trust:
+#    Check  Every run, including pull request validation. fmt and validate
+#           with `init -backend=false`. No service connection and no state.
+#    Apply  main only, as a deployment job on the "cimian-infrastructure"
+#           environment. Add an Approvals check to that environment
+#           (Pipelines > Environments). The job plans and applies in one go.
+#           The plan holds the client token and SAS in plain text, so it is
+#           never published as an artifact.
 #
-#  For pull requests in Azure Repos, add this pipeline as a build validation
-#  policy on main; the pr: block below only applies to GitHub-hosted repos.
+#  A pull request build runs the YAML from the pull request, so a condition in
+#  this file cannot keep it away from the service connection. Add a Branch
+#  control check on the service connection allowing only refs/heads/main;
+#  that check is what actually keeps pull requests from state and Key Vault.
 #
 #  Auth is the service connection's workload identity federation. AzureCLI@2
 #  with addSpnToEnvironment exposes the federated token, which Terraform uses
@@ -25,6 +31,8 @@ trigger:
     include:
       - infrastructure/**
 
+# For Azure Repos, add this pipeline as a build validation policy on main;
+# the pr: block only applies to GitHub-hosted repos.
 pr:
   branches:
     include:
@@ -46,7 +54,7 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
-  - name: azureServiceConnection          # workload identity federation
+  - name: azureServiceConnection          # workload identity federation; main-only branch control check
     value: '<ado-service-connection>'
   - name: terraformVersion
     value: '1.9.8'
@@ -66,66 +74,31 @@ variables:
     value: 'examplecimianstorage'
 
 stages:
-- stage: Plan
+- stage: Check
   jobs:
-  - job: plan
+  - job: check
     steps:
     - checkout: self
 
-    - task: AzureCLI@2
-      displayName: Terraform plan
+    - bash: |
+        set -euo pipefail
+        curl -fsSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+        sudo unzip -o -q /tmp/tf.zip -d /usr/local/bin
+        terraform fmt -check -recursive
+        terraform init -backend=false -input=false
+        terraform validate
+      displayName: Format, init without backend, validate
+      workingDirectory: infrastructure
       env:
         TF_VERSION: $(terraformVersion)
-        STATE_RG: $(TF_STATE_RESOURCE_GROUP)
-        STATE_SA: $(TF_STATE_STORAGE_ACCOUNT)
-        STATE_CONTAINER: $(TF_STATE_CONTAINER)
-        STATE_KEY: $(TF_STATE_KEY)
-        TF_VAR_pipeline_principal_id: $(TF_VAR_pipeline_principal_id)
-        TF_VAR_storage_account_name: $(TF_VAR_storage_account_name)
         TF_IN_AUTOMATION: 'true'
-      inputs:
-        azureSubscription: $(azureServiceConnection)
-        addSpnToEnvironment: true
-        scriptType: bash
-        scriptLocation: inlineScript
-        workingDirectory: infrastructure
-        inlineScript: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
-          sudo unzip -o -q /tmp/tf.zip -d /usr/local/bin
-
-          export ARM_USE_OIDC=true ARM_OIDC_TOKEN="$idToken" ARM_CLIENT_ID="$servicePrincipalId" ARM_TENANT_ID="$tenantId"
-          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
-
-          terraform init -input=false \
-            -backend-config="resource_group_name=$STATE_RG" \
-            -backend-config="storage_account_name=$STATE_SA" \
-            -backend-config="container_name=$STATE_CONTAINER" \
-            -backend-config="key=$STATE_KEY"
-          terraform fmt -check -recursive
-          terraform validate
-          set +e
-          terraform plan -input=false -lock-timeout=300s -detailed-exitcode -out=tfplan
-          rc=$?
-          set -e
-          case $rc in
-            0) echo "No changes."; echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false" ;;
-            2) echo "##vso[task.setvariable variable=hasChanges;isOutput=true]true" ;;
-            *) exit $rc ;;
-          esac
-      name: tf
-
-    - publish: infrastructure/tfplan
-      artifact: tfplan
-      condition: and(succeeded(), eq(variables['tf.hasChanges'], 'true'))
 
 - stage: Apply
-  dependsOn: Plan
+  dependsOn: Check
   condition: >-
     and(succeeded(),
         eq(variables['Build.SourceBranch'], 'refs/heads/main'),
-        ne(variables['Build.Reason'], 'PullRequest'),
-        eq(dependencies.Plan.outputs['plan.tf.hasChanges'], 'true'))
+        ne(variables['Build.Reason'], 'PullRequest'))
   jobs:
   - deployment: apply
     environment: cimian-infrastructure    # add an Approvals check here
@@ -134,25 +107,24 @@ stages:
         deploy:
           steps:
           - checkout: self
-          - download: current
-            artifact: tfplan
 
           - task: AzureCLI@2
-            displayName: Terraform apply
+            displayName: Terraform plan and apply
             env:
               TF_VERSION: $(terraformVersion)
               STATE_RG: $(TF_STATE_RESOURCE_GROUP)
               STATE_SA: $(TF_STATE_STORAGE_ACCOUNT)
               STATE_CONTAINER: $(TF_STATE_CONTAINER)
               STATE_KEY: $(TF_STATE_KEY)
-              PLAN_FILE: $(Pipeline.Workspace)/tfplan/tfplan
+              TF_VAR_pipeline_principal_id: $(TF_VAR_pipeline_principal_id)
+              TF_VAR_storage_account_name: $(TF_VAR_storage_account_name)
               TF_IN_AUTOMATION: 'true'
             inputs:
               azureSubscription: $(azureServiceConnection)
               addSpnToEnvironment: true
               scriptType: bash
               scriptLocation: inlineScript
-              workingDirectory: infrastructure
+              workingDirectory: $(Build.SourcesDirectory)/infrastructure
               inlineScript: |
                 set -euo pipefail
                 curl -fsSL -o /tmp/tf.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
@@ -166,6 +138,18 @@ stages:
                   -backend-config="storage_account_name=$STATE_SA" \
                   -backend-config="container_name=$STATE_CONTAINER" \
                   -backend-config="key=$STATE_KEY"
-                # Applying the saved plan fails if state moved since it was
-                # made, so what was approved is exactly what runs.
-                terraform apply -input=false -lock-timeout=300s "$PLAN_FILE"
+
+                # The approval gates this job, and the plan printed here is the
+                # record of what was applied. Sensitive values print as
+                # (sensitive value). The plan file never leaves the agent.
+                plan="$AGENT_TEMPDIRECTORY/tfplan"
+                set +e
+                terraform plan -input=false -lock-timeout=300s -detailed-exitcode -out="$plan"
+                rc=$?
+                set -e
+                case $rc in
+                  0) echo "No changes." ;;
+                  2) terraform apply -input=false -lock-timeout=300s "$plan" ;;
+                  *) exit $rc ;;
+                esac
+                rm -f "$plan"

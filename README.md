@@ -115,7 +115,7 @@ The engine and the group ladder live in
 beside this repo at the tag the pipelines pin:
 
 ```
-git clone --branch v0.1.1 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
 Project the inventory:
@@ -151,7 +151,7 @@ on a green build. So the input is validated before anything is written (row
 floors, resolution ratios, per-group and total shrink limits), a run that fails
 any check aborts whole rather than converging part of the estate, ownership
 markers keep the pipeline to its own objects, and `whatIf` is a supported way
-to run. See the [intune-gitops enrollment README](https://github.com/windowsadmins/intune-gitops/blob/v0.1.1/enrollment/README.md#guards).
+to run. See the [intune-gitops enrollment README](https://github.com/windowsadmins/intune-gitops/blob/v0.1.2/enrollment/README.md#guards).
 
 ## Cimian vs Munki
 

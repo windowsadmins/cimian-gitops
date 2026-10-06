@@ -38,7 +38,7 @@ jobs:
       - name: Inventory projection
         run: |
           python inventory/projections/project.py inventory/inventory.csv --out-dir "$RUNNER_TEMP/out"
-          head -1 "$RUNNER_TEMP/out/cimian.csv" | grep -qx 'serial,catalog,area,location,asset,usage,status,allocation,username,platform,fleet,hostname'
+          head -1 "$RUNNER_TEMP/out/cimian.csv" | tr -d '\r' | grep -qx 'serial,catalog,area,location,asset,usage,status,allocation,username,platform,fleet,hostname'
       - name: Intune condition lint on the sample manifests
         working-directory: intune
         run: python -m stages.lint_conditions manifests/

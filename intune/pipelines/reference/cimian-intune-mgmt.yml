@@ -338,8 +338,8 @@ stages:
             script: |
               Install-Module powershell-yaml -Force -AllowClobber
 
-        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the DevOps-Devices MI
-        # via the DevOps-Devices-Workloads service connection; the bearer token
+        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the bearer token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Push Intune Profiles"
@@ -384,7 +384,7 @@ stages:
 
               # -------------------------------------------------------------------
               function Get-AccessToken {
-                  # AzurePowerShell@5 has already Connect-AzAccount'd as the DevOps-Devices MI.
+                  # AzurePowerShell@5 has already Connect-AzAccount'd as the pipeline managed identity.
                   $token = (Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com").Token
                   # Az.Accounts 5.x returns .Token as a SecureString by default; convert to
                   # plaintext so the bearer header is a valid JWT (else Graph rejects it with
@@ -1204,8 +1204,8 @@ stages:
             script: |
               Install-Module powershell-yaml -Force -AllowClobber
 
-        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the DevOps-Devices MI
-        # via the DevOps-Devices-Workloads service connection; the bearer token
+        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the bearer token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Push Settings Catalog Profiles"
@@ -1252,7 +1252,7 @@ stages:
 
               # -------------------------------------------------------------------
               function Get-AccessToken {
-                  # AzurePowerShell@5 has already Connect-AzAccount'd as the DevOps-Devices MI.
+                  # AzurePowerShell@5 has already Connect-AzAccount'd as the pipeline managed identity.
                   $token = (Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com").Token
                   # Az.Accounts 5.x returns .Token as a SecureString by default; convert to
                   # plaintext so the bearer header is a valid JWT (else Graph rejects it with
@@ -2030,8 +2030,8 @@ stages:
             script: |
               Install-Module powershell-yaml -Force -AllowClobber
 
-        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the DevOps-Devices MI
-        # via the DevOps-Devices-Workloads service connection; the Graph token
+        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the Graph token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Push Windows Update Profiles"
@@ -2202,8 +2202,8 @@ stages:
             script: |
               Install-Module powershell-yaml -Force -AllowClobber
 
-        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the DevOps-Devices MI
-        # via the DevOps-Devices-Workloads service connection; the bearer token
+        # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the bearer token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Manage Microsoft Store Apps"
@@ -2260,7 +2260,7 @@ stages:
 
               # -------------------------------------------------------------------
               function Get-AccessToken {
-                  # AzurePowerShell@5 has already Connect-AzAccount'd as the DevOps-Devices MI.
+                  # AzurePowerShell@5 has already Connect-AzAccount'd as the pipeline managed identity.
                   $token = (Get-AzAccessToken -ResourceUrl "https://graph.microsoft.com").Token
                   # Az.Accounts 5.x returns .Token as a SecureString by default; convert to
                   # plaintext so the bearer header is a valid JWT (else Graph rejects it with
@@ -3619,8 +3619,8 @@ stages:
             pip install requests pyyaml azure-identity
           displayName: "Install Python dependencies"
 
-        # WIF: AzureCLI@2 pre-authenticates `az` as the DevOps-Devices MI via the
-        # DevOps-Devices-Workloads service connection; the inner Python resolves
+        # WIF: AzureCLI@2 pre-authenticates `az` as the pipeline managed identity via the
+        # $(INTUNE_SERVICE_CONNECTION) service connection; the inner Python resolves
         # that session through DefaultAzureCredential.
         - task: AzureCLI@2
           displayName: "Assign Profiles and Apps to Groups"
@@ -3662,8 +3662,8 @@ stages:
             pip install requests pyyaml azure-identity
           displayName: "Install Python dependencies"
 
-        # WIF: AzureCLI@2 pre-authenticates `az` as the DevOps-Devices MI via the
-        # DevOps-Devices-Workloads service connection; the inner Python resolves
+        # WIF: AzureCLI@2 pre-authenticates `az` as the pipeline managed identity via the
+        # $(INTUNE_SERVICE_CONNECTION) service connection; the inner Python resolves
         # that session through DefaultAzureCredential.
         - task: AzureCLI@2
           displayName: "Upsert + assign + reconcile deviceHealthScripts"

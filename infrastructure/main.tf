@@ -327,12 +327,14 @@ resource "azurerm_cdn_frontdoor_route" "bootstrap" {
   cdn_frontdoor_origin_group_id   = azurerm_cdn_frontdoor_origin_group.blob.id
   cdn_frontdoor_origin_ids        = [azurerm_cdn_frontdoor_origin.blob.id]
   cdn_frontdoor_custom_domain_ids = azurerm_cdn_frontdoor_custom_domain.cimian[*].id
-  cdn_frontdoor_origin_path       = "/public/bootstrap"
-  patterns_to_match               = ["/bootstrap/*"]
-  supported_protocols             = ["Http", "Https"]
-  https_redirect_enabled          = true
-  forwarding_protocol             = "HttpsOnly"
-  link_to_default_domain          = true
+  # Front Door prepends the origin path to the whole request path, so
+  # /bootstrap/management.json is fetched from /public/bootstrap/management.json.
+  cdn_frontdoor_origin_path = "/public"
+  patterns_to_match         = ["/bootstrap/*"]
+  supported_protocols       = ["Http", "Https"]
+  https_redirect_enabled    = true
+  forwarding_protocol       = "HttpsOnly"
+  link_to_default_domain    = true
 
   cache {
     query_string_caching_behavior = "IgnoreQueryString"

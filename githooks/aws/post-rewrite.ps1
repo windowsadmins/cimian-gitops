@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# HOOK_VERSION = '2026.06.25'
+# HOOK_VERSION = '2026.10.06'
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-rewrite.ps1  –  safety net after git rebase / git commit --amend (AWS)
@@ -21,8 +21,9 @@ $ErrorActionPreference = 'Stop'
 $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 . (Join-Path (Join-Path $HookDir '..') 'lib\common.ps1')
 
-Test-HookVersion -HookName 'post-rewrite' -HookVersion '2026.06.25'
+Test-HookVersion -HookName 'post-rewrite' -HookVersion '2026.10.06'
 if (Test-ShouldSkipHook -HookName 'post-rewrite') { exit 0 }
+if (Test-SkipInLinkedWorktree -HookName 'post-rewrite') { exit 0 }
 Add-WorktreeCacheLink
 
 # Git passes the rewrite command ('rebase' or 'amend') as the first argument.

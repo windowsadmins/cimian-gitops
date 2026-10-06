@@ -339,7 +339,7 @@ stages:
               Install-Module powershell-yaml -Force -AllowClobber
 
         # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
-        # via the intune-graph-write service connection; the bearer token
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the bearer token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Push Intune Profiles"
@@ -1205,7 +1205,7 @@ stages:
               Install-Module powershell-yaml -Force -AllowClobber
 
         # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
-        # via the intune-graph-write service connection; the bearer token
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the bearer token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Push Settings Catalog Profiles"
@@ -2031,7 +2031,7 @@ stages:
               Install-Module powershell-yaml -Force -AllowClobber
 
         # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
-        # via the intune-graph-write service connection; the Graph token
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the Graph token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Push Windows Update Profiles"
@@ -2203,7 +2203,7 @@ stages:
               Install-Module powershell-yaml -Force -AllowClobber
 
         # WIF: AzurePowerShell@5 runs Connect-AzAccount as the pipeline managed identity
-        # via the intune-graph-write service connection; the bearer token
+        # via the $(INTUNE_SERVICE_CONNECTION) service connection; the bearer token
         # comes from Get-AzAccessToken instead of a client-secret Get-MsalToken.
         - task: AzurePowerShell@5
           displayName: "Manage Microsoft Store Apps"
@@ -3620,7 +3620,7 @@ stages:
           displayName: "Install Python dependencies"
 
         # WIF: AzureCLI@2 pre-authenticates `az` as the pipeline managed identity via the
-        # intune-graph-write service connection; the inner Python resolves
+        # $(INTUNE_SERVICE_CONNECTION) service connection; the inner Python resolves
         # that session through DefaultAzureCredential.
         - task: AzureCLI@2
           displayName: "Assign Profiles and Apps to Groups"
@@ -3663,7 +3663,7 @@ stages:
           displayName: "Install Python dependencies"
 
         # WIF: AzureCLI@2 pre-authenticates `az` as the pipeline managed identity via the
-        # intune-graph-write service connection; the inner Python resolves
+        # $(INTUNE_SERVICE_CONNECTION) service connection; the inner Python resolves
         # that session through DefaultAzureCredential.
         - task: AzureCLI@2
           displayName: "Upsert + assign + reconcile deviceHealthScripts"

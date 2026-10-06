@@ -1,40 +1,60 @@
 # ──────────────────────────────────────────────────────────────────────────────
-#  push-to-production-azure.yml — sync the Cimian deployment tree to Azure Blob.
+#  push-to-production-azure.yml — publish the Cimian repo to Azure Blob.
 #
-#  This is the Cimian companion to munki-gitops' azure/push-to-production-azure.yml.
-#  On every commit that touches deployment/** it rebuilds the catalogs, then mirrors
-#  deployment/{catalogs,manifests,pkgsinfo} to Azure Blob storage with azcopy and
-#  purges the Front Door edge cache so clients see the change immediately.
+#  The Cimian companion to munki-gitops' push-to-production-azure.yml. On every
+#  merge that touches deployment/** it rebuilds the catalogs with makecatalogs,
+#  refuses to publish if any pkgsinfo points at a package that is not in the
+#  container, syncs the metadata and source trees, and purges the Front Door
+#  edge so clients see the change on their next check.
 #
-#  Packages themselves (.nupkg / .msi / .exe) are committed under deployment/pkgs
-#  and synced separately/out-of-band; this pipeline only ships the metadata that
-#  managedsoftwareupdate reads. Every name below is a placeholder — swap the
-#  variables block for yours and it runs.
+#  Package binaries are not in git. The pre-push hook uploads them to
+#  deployment/pkgs/ when the pkgsinfo that references them is pushed; this
+#  pipeline only checks they are there. If you do commit binaries (Git LFS),
+#  the pkgs sync below picks them up.
+#
+#  Auth is the service connection's workload identity federation. There is no
+#  SAS token and no client secret; the identity needs Storage Blob Data
+#  Contributor on the storage account and CDN Endpoint Contributor on the Front
+#  Door profile. Every name below is a placeholder.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# batch: a run never starts beside its predecessor from CI. Two overlapping runs
+# can finish out of order and leave the CDN serving the older catalogs.
 trigger:
+  batch: true
   branches:
     include:
       - main
   paths:
     include:
       - /deployment/**
+      - /installers/**
 
 pool:
   vmImage: windows-latest
 
 variables:
-  - group: cimian-repo-secrets            # contains SAS token + connection IDs
-  - name: AZ_STORAGE_URL                  # e.g. https://<storage-account>.blob.core.windows.net/repo
-    value: '<blob-url-with-SAS>'
-  - name: FDO_ENDPOINT_NAME               # Front Door endpoint
+  - group: cimian-repo-secrets            # GitHubReadToken (public-repo read)
+  - name: azureServiceConnection          # workload identity federation
+    value: '<ado-service-connection>'
+  - name: STORAGE_ACCOUNT
+    value: 'examplecimianstorage'
+  - name: STORAGE_CONTAINER
+    value: 'repo'
+  - name: FD_RESOURCE_GROUP
+    value: '<resource-group>'
+  - name: FD_PROFILE
+    value: '<frontdoor-profile>'
+  - name: FD_ENDPOINT
     value: '<frontdoor-endpoint>'
-  - name: azureServiceConnection
-    value: '<ADO-service-connection>'
+  # The windowsadmins/cimian release the catalog tools come from. Pinned, so a
+  # new makecatalogs only reaches production through a reviewed edit.
+  - name: CIMIAN_TOOLS_TAG
+    value: '2026.09.18.1356'
+  - name: TOOLS_DIR
+    value: '$(Agent.TempDirectory)/cimian-tools'
   - name: REPO_PATH
-    value: '/deployment'
-  - name: MAKECATALOGS_PATH
-    value: '$(Build.ArtifactStagingDirectory)/makecatalogs.exe'
+    value: '$(Build.SourcesDirectory)/deployment'
 
 stages:
 - stage: PushCimianRepo
@@ -43,60 +63,111 @@ stages:
     steps:
     - checkout: self
       clean: true
-      persistCredentials: true
+      fetchDepth: 2
+
+    # `batch: true` only orders CI runs against each other. A run queued by hand
+    # or through the API starts at once beside an in-flight one, and two runs
+    # uploading the same blobs at the same moment fail each other. Wait here,
+    # before anything is built, until no lower-numbered run is active. Fails
+    # open if the run list cannot be read: this guard must never itself block a
+    # deploy.
+    - pwsh: |
+        $me = [int]$env:BUILD_BUILDID
+        $project = [Uri]::EscapeDataString($env:SYSTEM_TEAMPROJECT)
+        $uri = "$($env:SYSTEM_COLLECTIONURI)$project/_apis/build/builds?definitions=$($env:SYSTEM_DEFINITIONID)&statusFilter=inProgress,notStarted&api-version=7.1"
+        $headers = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }
+        $deadline = (Get-Date).AddMinutes(40)
+        $failures = 0
+        while ($true) {
+          try {
+            $runs = @((Invoke-RestMethod -Uri $uri -Headers $headers).value)
+          } catch {
+            if (++$failures -ge 3) {
+              Write-Host "##vso[task.logissue type=warning]Could not list earlier runs ($($_.Exception.Message)); continuing without the overlap guard."
+              break
+            }
+            Start-Sleep -Seconds 10; continue
+          }
+          $ahead = @($runs | Where-Object { [int]$_.id -lt $me } | ForEach-Object { $_.id })
+          if ($ahead.Count -eq 0) { Write-Host 'No earlier run is active.'; break }
+          if ((Get-Date) -gt $deadline) { throw "Earlier run(s) $($ahead -join ', ') still active after 40 minutes." }
+          Write-Host "Waiting for earlier run(s) $($ahead -join ', ')..."
+          Start-Sleep -Seconds 20
+        }
+      displayName: Wait for earlier runs
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     - pwsh: |
-        git sparse-checkout init --cone
-        git sparse-checkout set deployment pipelines
-      displayName: Sparse checkout
+        & '$(Build.SourcesDirectory)/pipelines/scripts/Install-CimianTools.ps1' -Tag '$(CIMIAN_TOOLS_TAG)' -Destination '$(TOOLS_DIR)' -Tools makecatalogs.exe
+      displayName: Install pinned makecatalogs
+      env:
+        GITHUB_TOKEN: $(GitHubReadToken)
 
     - pwsh: |
-        # Fetch the makecatalogs binary from the public windowsadmins/cimian release.
-        # Substitute an Azure Artifacts UniversalPackages@0 download if you publish
-        # makecatalogs to an internal feed instead.
-        $tag = 'latest'
-        $rel = if ($tag -eq 'latest') { 'latest/download' } else { "download/$tag" }
-        $url = "https://github.com/windowsadmins/cimian/releases/$rel/makecatalogs.exe"
-        Write-Host "Downloading $url"
-        Invoke-WebRequest -Uri $url -OutFile "$(MAKECATALOGS_PATH)" -UseBasicParsing
-      displayName: Install Cimian makecatalogs
-
-    - pwsh: |
-        & "$(MAKECATALOGS_PATH)" "$(Build.SourcesDirectory)$(REPO_PATH)"
+        & '$(TOOLS_DIR)/makecatalogs.exe' --repo_path '$(REPO_PATH)'
         if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+        if (-not (Get-ChildItem '$(REPO_PATH)/catalogs' -Filter *.yaml -ErrorAction SilentlyContinue)) {
+          throw 'makecatalogs wrote no catalogs'
+        }
       displayName: Run makecatalogs
 
-    - pwsh: |
-        # Strip any chunked/temp package fragments before sync so only finished
-        # .nupkg / .msi / .exe artifacts ever reach the bucket.
-        Get-ChildItem "$(Build.SourcesDirectory)/deployment/pkgs" -Recurse -File `
-          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
-          Remove-Item -Force
-      displayName: Sanitize /pkgs folder
-
     - task: AzureCLI@2
+      displayName: 'Gate: every pkgsinfo location exists in blob'
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: pscore
         scriptLocation: inlineScript
         inlineScript: |
-          foreach ($d in 'catalogs','manifests','pkgsinfo') {
-            azcopy sync `
-              "$(Build.SourcesDirectory)/deployment/$d" `
-              "$(AZ_STORAGE_URL)/deployment/$d$(AZ_SAS)" `
-              --recursive --delete-destination=true
-          }
-      displayName: Sync to Azure Blob
+          $inv = Join-Path '$(Agent.TempDirectory)' 'pkgs-inventory.txt'
+          az storage blob list --auth-mode login `
+            --account-name '$(STORAGE_ACCOUNT)' --container-name '$(STORAGE_CONTAINER)' `
+            --prefix 'deployment/pkgs/' --num-results '*' --query '[].name' -o tsv > $inv
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list deployment/pkgs; the identity needs Storage Blob Data Reader or better.' }
+          & '$(Build.SourcesDirectory)/pipelines/scripts/Test-PackagesPresent.ps1' -RepoPath '$(REPO_PATH)' -InventoryFile $inv
 
+    # azcopy picks up the service connection's login from the az CLI session.
+    # Metadata trees mirror git exactly (--delete-destination); packages and
+    # source trees are only ever added to, because a package another branch's
+    # pkgsinfo still uses must not vanish when main stops referencing it.
     - task: AzureCLI@2
+      displayName: Sync to Azure Blob
+      env:
+        AZCOPY_AUTO_LOGIN_TYPE: AZCLI
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://$(STORAGE_ACCOUNT).blob.core.windows.net/$(STORAGE_CONTAINER)'
+          function Sync($src, $dest, [bool] $mirror) {
+            if (-not (Test-Path $src)) { Write-Host "Skipping $src (not in this repo)"; return }
+            $del = if ($mirror) { 'true' } else { 'false' }
+            azcopy sync $src "$base/$dest" --recursive --delete-destination=$del
+            if ($LASTEXITCODE -ne 0) { throw "azcopy sync $src failed ($LASTEXITCODE)" }
+          }
+          foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') {
+            Sync "$(REPO_PATH)/$d" "deployment/$d" $true
+          }
+          Sync '$(REPO_PATH)/pkgs' 'deployment/pkgs' $false
+          Sync '$(Build.SourcesDirectory)/installers' 'installers' $false
+          Sync '$(Build.SourcesDirectory)/packages' 'packages' $false
+
+    # Never purge /deployment/pkgs/*: packages are version-named, so a new build
+    # is a new path and there is no stale copy at the edge. Purging them forces
+    # every client to re-pull cold from origin.
+    - task: AzureCLI@2
+      displayName: Purge Front Door (metadata only)
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: pscore
         scriptLocation: inlineScript
         inlineScript: |
           az afd endpoint purge `
-            --resource-group '<resource-group>' `
-            --profile-name '<frontdoor-profile>' `
-            --endpoint-name '$(FDO_ENDPOINT_NAME)' `
-            --content-paths '/*'
-      displayName: Purge Front Door
+            --resource-group '$(FD_RESOURCE_GROUP)' `
+            --profile-name '$(FD_PROFILE)' `
+            --endpoint-name '$(FD_ENDPOINT)' `
+            --content-paths '/deployment/catalogs/*' '/deployment/manifests/*' '/deployment/pkgsinfo/*' '/deployment/icons/*' `
+            --no-wait
+          if ($LASTEXITCODE -ne 0) { throw "az afd endpoint purge failed ($LASTEXITCODE)" }

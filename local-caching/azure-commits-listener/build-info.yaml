@@ -1,13 +1,17 @@
+# cimipkg build-info. ${TIMESTAMP} becomes a YYYY.MM.DD.HHMM version at build
+# time, and ${SIGNING_CERT_SUBJECT} is read from the environment or a .env file
+# beside this one. The payload is flat: payload/* lands directly in
+# install_location.
 product:
   name: CimianCommitsListener
-  version: 2025.04.16
+  version: ${TIMESTAMP}
   developer: <your-org>
-  identifier: com.domain.cimian.CommitsListener
+  identifier: com.example.cimian.CommitsListener
+  category: Management
   description: >-
     Azure Service Bus listener for a Windows Cimian caching server. On a commit
     event it runs git pull + azcopy sync to refresh the local deployment tree.
     Sample/template — all connection details are env-driven, none are baked in.
-architecture: x64
-install_location: C:\Program Files\
+install_location: 'C:\Program Files\CimianCommitsListener'
 postinstall_action: none
-signing_certificate: <signing-cert-subject-or-thumbprint>
+signing_certificate: ${SIGNING_CERT_SUBJECT}

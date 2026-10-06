@@ -1,66 +1,92 @@
-name: Cimian Deploy (AWS S3 + CloudFront)
+# push-to-production-aws.yml — publish the Cimian repo to S3 + CloudFront.
+#
+# GitHub Actions twin of pipelines/azure/push-to-production-aws.yml. Copy it to
+# .github/workflows/ in your Cimian repo.
+#
+# Auth is OpenID Connect: configure-aws-credentials assumes an IAM role whose
+# trust policy accepts token.actions.githubusercontent.com for this repo's main
+# branch. No access keys are stored. The role needs s3:ListBucket,
+# s3:PutObject and s3:DeleteObject on the bucket and
+# cloudfront:CreateInvalidation on the distribution.
+
+name: Cimian push to production (AWS)
 
 on:
   push:
     branches: [main]
-    paths:   ['deployment/**']
+    paths: ['deployment/**', 'installers/**']
+  workflow_dispatch:
+
+# One run at a time, and never cancel one mid-upload.
+concurrency:
+  group: cimian-push-production
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+  CIMIAN_TOOLS_TAG: '2026.09.18.1356'
 
 jobs:
   deploy:
     runs-on: windows-latest
-    env:
-      S3_BUCKET:  ${{ secrets.S3_BUCKET }}
-      DIST_ID:    ${{ secrets.CLOUDFRONT_DIST }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        sparse-checkout: |
-          deployment
-          pipelines
-        fetch-depth: 1
+      - uses: actions/checkout@v4
 
-    - name: Configure AWS creds
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region:            ${{ env.AWS_REGION }}
+      - name: Install pinned makecatalogs
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./pipelines/scripts/Install-CimianTools.ps1 -Tag $env:CIMIAN_TOOLS_TAG -Destination "$env:RUNNER_TEMP/cimian-tools" -Tools makecatalogs.exe
 
-    - name: Install Cimian makecatalogs
-      shell: pwsh
-      run: |
-        Invoke-WebRequest -UseBasicParsing `
-          -Uri 'https://github.com/windowsadmins/cimian/releases/latest/download/makecatalogs.exe' `
-          -OutFile "$env:RUNNER_TEMP\makecatalogs.exe"
+      - name: Run makecatalogs
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/cimian-tools/makecatalogs.exe" --repo_path "$env:GITHUB_WORKSPACE/deployment"
+          if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+          if (-not (Get-ChildItem deployment/catalogs -Filter *.yaml -ErrorAction SilentlyContinue)) {
+            throw 'makecatalogs wrote no catalogs'
+          }
 
-    - name: Build catalogs
-      shell: pwsh
-      run: |
-        & "$env:RUNNER_TEMP\makecatalogs.exe" "${{ github.workspace }}\deployment"
-        if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-    - name: Clean temp chunks
-      shell: pwsh
-      run: |
-        Get-ChildItem deployment/pkgs -Recurse -File `
-          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
-          Remove-Item -Force
+      - name: 'Gate: every pkgsinfo location exists in S3'
+        shell: pwsh
+        run: |
+          $inv = Join-Path $env:RUNNER_TEMP 'pkgs-inventory.txt'
+          aws s3api list-objects-v2 --bucket $env:S3_BUCKET --prefix 'deployment/pkgs/' `
+            --query 'Contents[].Key' --output text |
+            ForEach-Object { $_ -split "`t" } | Where-Object { $_ -and $_ -ne 'None' } |
+            Set-Content -LiteralPath $inv
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list deployment/pkgs in S3.' }
+          ./pipelines/scripts/Test-PackagesPresent.ps1 -RepoPath deployment -InventoryFile $inv
 
-    - name: Sync catalogs to S3
-      shell: pwsh
-      run: |
-        aws s3 sync deployment/catalogs  s3://$env:S3_BUCKET/deployment/catalogs  --delete
+      - name: Sync to S3
+        shell: pwsh
+        run: |
+          function Sync($src, $dest, [bool] $mirror) {
+            if (-not (Test-Path $src)) { Write-Host "Skipping $src (not in this repo)"; return }
+            $extra = if ($mirror) { @('--delete') } else { @() }
+            aws s3 sync $src "s3://$env:S3_BUCKET/$dest" @extra
+            if ($LASTEXITCODE -ne 0) { throw "aws s3 sync $src failed ($LASTEXITCODE)" }
+          }
+          foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') { Sync "deployment/$d" "deployment/$d" $true }
+          Sync 'deployment/pkgs' 'deployment/pkgs' $false
+          Sync 'installers' 'installers' $false
+          Sync 'packages' 'packages' $false
 
-    - name: Sync manifests + pkgsinfo
-      shell: pwsh
-      run: |
-        aws s3 sync deployment/manifests s3://$env:S3_BUCKET/deployment/manifests --delete
-        aws s3 sync deployment/pkgsinfo  s3://$env:S3_BUCKET/deployment/pkgsinfo  --delete
-
-    - name: Invalidate CloudFront
-      shell: pwsh
-      run: |
-        aws cloudfront create-invalidation --distribution-id "$env:DIST_ID" --paths "/*"
+      - name: Invalidate CloudFront (metadata only)
+        shell: pwsh
+        run: |
+          aws cloudfront create-invalidation --distribution-id $env:CLOUDFRONT_DISTRIBUTION_ID `
+            --paths '/deployment/catalogs/*' '/deployment/manifests/*' '/deployment/pkgsinfo/*' '/deployment/icons/*'
+          if ($LASTEXITCODE -ne 0) { throw "CloudFront invalidation failed ($LASTEXITCODE)" }

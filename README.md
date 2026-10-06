@@ -32,7 +32,8 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | `githooks/` | PowerShell git hooks (`azure/` + `aws/`) that validate pkgsinfo on commit, download referenced packages on pull, and sync the repo to cloud storage on push. Opt-in per clone. |
 | `githooks/lib/` | Shared helpers (`common.ps1`), the structural pkgsinfo linter (`pkgsinfo-lint.py`), and the superseded-pkgsinfo resolver. |
 | `pipelines/azure/` | Azure DevOps pipelines: `push-to-production-*` (build catalogs + sync storage) and `bootstrap-to-intune.yml` (the centerpiece). |
-| `pipelines/github/` | The same pipelines as GitHub Actions workflows. |
+| `pipelines/github/` | The same pipelines as GitHub Actions workflows, authenticating with OpenID Connect. |
+| `pipelines/scripts/` | Helpers the pipelines share: a retrying GitHub Releases client, the pinned Cimian tools installer, and the missing-package gate. |
 | `preflight/cimian/` | A cimipkg sample that installs a Cimian preflight script run before each check. |
 | `local-caching/` | Service Bus / SQS commit-listener packages that keep on-prem caching servers in sync. |
 | `inventory/` | The twelve-column device contract, a sample fleet, and the projection script that narrows it per system. |

@@ -1,33 +1,46 @@
 # ──────────────────────────────────────────────────────────────────────────────
-#  push-to-production-aws.yml — sync the Cimian deployment tree to AWS S3.
+#  push-to-production-aws.yml — publish the Cimian repo to S3 + CloudFront.
 #
-#  Same flow as push-to-production-azure.yml, but the cloud backend is S3 +
-#  CloudFront instead of Azure Blob + Front Door. Runs on an Azure DevOps Windows
-#  agent so the Cimian makecatalogs binary runs natively. Every name below is a
+#  Same flow as push-to-production-azure.yml with S3 and CloudFront as the
+#  backend. Runs on an Azure DevOps Windows agent so makecatalogs runs natively.
+#
+#  Auth: an AWS Toolkit service connection. Configure it to assume a role with
+#  OIDC ("Use OIDC" on the connection) rather than storing an access key; the
+#  role needs s3:ListBucket, s3:PutObject, s3:DeleteObject on the bucket and
+#  cloudfront:CreateInvalidation on the distribution. Every name below is a
 #  placeholder.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# batch: a run never starts beside its predecessor from CI.
 trigger:
+  batch: true
   branches:
     include:
       - main
   paths:
     include:
       - /deployment/**
+      - /installers/**
 
 pool:
   vmImage: windows-latest
 
 variables:
-  - group: cimian-repo-secrets
-  - name: S3_BUCKET_NAME       # e.g. cimian-prod-bucket
+  - group: cimian-repo-secrets            # GitHubReadToken (public-repo read)
+  - name: awsServiceConnection
+    value: '<aws-service-connection>'
+  - name: AWS_REGION
+    value: '<region>'
+  - name: S3_BUCKET
     value: '<your-bucket>'
-  - name: AWS_DISTRIBUTION_ID  # CloudFront distribution
-    value: '<E123ABCXYZ>'
+  - name: CLOUDFRONT_DISTRIBUTION_ID
+    value: '<distribution-id>'
+  - name: CIMIAN_TOOLS_TAG
+    value: '2026.09.18.1356'
+  - name: TOOLS_DIR
+    value: '$(Agent.TempDirectory)/cimian-tools'
   - name: REPO_PATH
-    value: '/deployment'
-  - name: MAKECATALOGS_PATH
-    value: '$(Build.ArtifactStagingDirectory)/makecatalogs.exe'
+    value: '$(Build.SourcesDirectory)/deployment'
 
 stages:
 - stage: PushCimianRepo
@@ -36,72 +49,97 @@ stages:
     steps:
     - checkout: self
       clean: true
-      persistCredentials: true
+      fetchDepth: 2
+
+    # See push-to-production-azure.yml: a run queued by hand would otherwise
+    # start beside an in-flight one. Fails open.
+    - pwsh: |
+        $me = [int]$env:BUILD_BUILDID
+        $project = [Uri]::EscapeDataString($env:SYSTEM_TEAMPROJECT)
+        $uri = "$($env:SYSTEM_COLLECTIONURI)$project/_apis/build/builds?definitions=$($env:SYSTEM_DEFINITIONID)&statusFilter=inProgress,notStarted&api-version=7.1"
+        $headers = @{ Authorization = "Bearer $env:SYSTEM_ACCESSTOKEN" }
+        $deadline = (Get-Date).AddMinutes(40)
+        $failures = 0
+        while ($true) {
+          try {
+            $runs = @((Invoke-RestMethod -Uri $uri -Headers $headers).value)
+          } catch {
+            if (++$failures -ge 3) {
+              Write-Host "##vso[task.logissue type=warning]Could not list earlier runs ($($_.Exception.Message)); continuing without the overlap guard."
+              break
+            }
+            Start-Sleep -Seconds 10; continue
+          }
+          $ahead = @($runs | Where-Object { [int]$_.id -lt $me } | ForEach-Object { $_.id })
+          if ($ahead.Count -eq 0) { Write-Host 'No earlier run is active.'; break }
+          if ((Get-Date) -gt $deadline) { throw "Earlier run(s) $($ahead -join ', ') still active after 40 minutes." }
+          Write-Host "Waiting for earlier run(s) $($ahead -join ', ')..."
+          Start-Sleep -Seconds 20
+        }
+      displayName: Wait for earlier runs
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     - pwsh: |
-        git sparse-checkout init --cone
-        git sparse-checkout set deployment pipelines
-      displayName: Sparse checkout
+        & '$(Build.SourcesDirectory)/pipelines/scripts/Install-CimianTools.ps1' -Tag '$(CIMIAN_TOOLS_TAG)' -Destination '$(TOOLS_DIR)' -Tools makecatalogs.exe
+      displayName: Install pinned makecatalogs
+      env:
+        GITHUB_TOKEN: $(GitHubReadToken)
 
     - pwsh: |
-        # Fetch the makecatalogs binary from the public windowsadmins/cimian release.
-        $tag = 'latest'
-        $rel = if ($tag -eq 'latest') { 'latest/download' } else { "download/$tag" }
-        $url = "https://github.com/windowsadmins/cimian/releases/$rel/makecatalogs.exe"
-        Write-Host "Downloading $url"
-        Invoke-WebRequest -Uri $url -OutFile "$(MAKECATALOGS_PATH)" -UseBasicParsing
-      displayName: Install Cimian makecatalogs
-
-    - pwsh: |
-        & "$(MAKECATALOGS_PATH)" "$(Build.SourcesDirectory)$(REPO_PATH)"
+        & '$(TOOLS_DIR)/makecatalogs.exe' --repo_path '$(REPO_PATH)'
         if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
+        if (-not (Get-ChildItem '$(REPO_PATH)/catalogs' -Filter *.yaml -ErrorAction SilentlyContinue)) {
+          throw 'makecatalogs wrote no catalogs'
+        }
       displayName: Run makecatalogs
 
-    - pwsh: |
-        Get-ChildItem "$(Build.SourcesDirectory)/deployment/pkgs" -Recurse -File `
-          -Include '*.nupkg.*','*.msi.*','*.exe.*' -ErrorAction SilentlyContinue |
-          Remove-Item -Force
-      displayName: Sanitize /pkgs folder
-
-    - task: AWSCLI@1
+    - task: AWSPowerShellModuleScript@1
+      displayName: 'Gate: every pkgsinfo location exists in S3'
       inputs:
-        awsCredentials: AWS Credentials
-        regionName: ca-central-1
-        awsCommand: s3
-        awsSubCommand: sync
-        awsArguments: |
-          $(Build.SourcesDirectory)/deployment/catalogs `
-          s3://$(S3_BUCKET_NAME)/deployment/catalogs --delete
-      displayName: Sync catalogs
+        awsCredentials: $(awsServiceConnection)
+        regionName: $(AWS_REGION)
+        scriptType: inline
+        inlineScript: |
+          $inv = Join-Path '$(Agent.TempDirectory)' 'pkgs-inventory.txt'
+          aws s3api list-objects-v2 --bucket '$(S3_BUCKET)' --prefix 'deployment/pkgs/' `
+            --query 'Contents[].Key' --output text |
+            ForEach-Object { $_ -split "`t" } | Where-Object { $_ -and $_ -ne 'None' } |
+            Set-Content -LiteralPath $inv
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list deployment/pkgs in S3.' }
+          & '$(Build.SourcesDirectory)/pipelines/scripts/Test-PackagesPresent.ps1' -RepoPath '$(REPO_PATH)' -InventoryFile $inv
 
-    - task: AWSCLI@1
+    # Metadata trees mirror git exactly (--delete); packages and source trees
+    # are only ever added to.
+    - task: AWSPowerShellModuleScript@1
+      displayName: Sync to S3
       inputs:
-        awsCredentials: AWS Credentials
-        regionName: ca-central-1
-        awsCommand: s3
-        awsSubCommand: sync
-        awsArguments: |
-          $(Build.SourcesDirectory)/deployment/manifests `
-          s3://$(S3_BUCKET_NAME)/deployment/manifests --delete
-      displayName: Sync manifests
+        awsCredentials: $(awsServiceConnection)
+        regionName: $(AWS_REGION)
+        scriptType: inline
+        inlineScript: |
+          $ErrorActionPreference = 'Stop'
+          function Sync($src, $dest, [bool] $mirror) {
+            if (-not (Test-Path $src)) { Write-Host "Skipping $src (not in this repo)"; return }
+            $extra = if ($mirror) { @('--delete') } else { @() }
+            aws s3 sync $src "s3://$(S3_BUCKET)/$dest" @extra
+            if ($LASTEXITCODE -ne 0) { throw "aws s3 sync $src failed ($LASTEXITCODE)" }
+          }
+          foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') {
+            Sync "$(REPO_PATH)/$d" "deployment/$d" $true
+          }
+          Sync '$(REPO_PATH)/pkgs' 'deployment/pkgs' $false
+          Sync '$(Build.SourcesDirectory)/installers' 'installers' $false
+          Sync '$(Build.SourcesDirectory)/packages' 'packages' $false
 
-    - task: AWSCLI@1
+    # Metadata only. Packages are version-named and never stale at the edge.
+    - task: AWSPowerShellModuleScript@1
+      displayName: Invalidate CloudFront (metadata only)
       inputs:
-        awsCredentials: AWS Credentials
-        regionName: ca-central-1
-        awsCommand: s3
-        awsSubCommand: sync
-        awsArguments: |
-          $(Build.SourcesDirectory)/deployment/pkgsinfo `
-          s3://$(S3_BUCKET_NAME)/deployment/pkgsinfo --delete
-      displayName: Sync pkgsinfo
-
-    - task: AWSCLI@1
-      inputs:
-        awsCredentials: AWS Credentials
-        regionName: us-east-1
-        awsCommand: cloudfront
-        awsSubCommand: create-invalidation
-        awsArguments: |
-          --distribution-id $(AWS_DISTRIBUTION_ID) --paths "/*"
-      displayName: Invalidate CloudFront
+        awsCredentials: $(awsServiceConnection)
+        regionName: $(AWS_REGION)
+        scriptType: inline
+        inlineScript: |
+          aws cloudfront create-invalidation --distribution-id '$(CLOUDFRONT_DISTRIBUTION_ID)' `
+            --paths '/deployment/catalogs/*' '/deployment/manifests/*' '/deployment/pkgsinfo/*' '/deployment/icons/*'
+          if ($LASTEXITCODE -ne 0) { throw "CloudFront invalidation failed ($LASTEXITCODE)" }

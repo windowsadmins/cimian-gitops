@@ -2,7 +2,7 @@
 
 Samples for managing a Windows fleet with [Cimian](https://github.com/windowsadmins/cimian) — the Windows-native managed-software tool modelled on [Munki](https://github.com/munki/munki) — entirely from Git: hooks, CI/CD pipelines, message queues, and local caching servers. This is the Windows companion to [munki-gitops](https://github.com/rodchristiansen/munki-gitops); the two repos mirror each other so a shop running both fleets uses one mental model.
 
-**Cloud Provider Options**: every sample ships in both an **Azure** form (Azure DevOps, Azure Blob Storage, Service Bus, Front Door) and an **AWS** form (GitHub Actions, S3, SQS/SNS, CloudFront). Pick the cloud you're on; the admin experience is identical.
+**Cloud Provider Options**: the samples ship as Azure DevOps pipelines and as GitHub Actions workflows, against Azure Blob Storage, Service Bus and Front Door or against S3, SQS and CloudFront. Every pipeline signs in with workload identity federation or OpenID Connect, so no client secret or access key is stored anywhere. Pick the CI and cloud you're on; the admin experience is identical.
 
 ## MDM as a dumb, approved pipe
 
@@ -23,6 +23,7 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 - Git hooks that upload/download packages automatically (Azure Blob or S3)
 - A separate working copy per admin, validated on every commit
 - Local caching servers that sync intelligently over Service Bus / SQS
+- AutoPkg imports that land in Testing and move to Production on a schedule, without a hand edit
 - A full CI/CD system that builds, signs, promotes, and deploys via pull requests
 
 ## What's in here
@@ -30,10 +31,11 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | Path | What it is |
 |------|------------|
 | `githooks/` | PowerShell git hooks (`azure/` + `aws/`) that validate pkgsinfo on commit, download referenced packages on pull, and sync the repo to cloud storage on push. Opt-in per clone. |
-| `githooks/lib/` | Shared helpers (`common.ps1`), the structural pkgsinfo linter (`pkgsinfo-lint.py`), and the superseded-pkgsinfo resolver. |
-| `pipelines/azure/` | Azure DevOps pipelines: `push-to-production-*` (build catalogs + sync storage) and `bootstrap-to-intune.yml` (the centerpiece). |
-| `pipelines/github/` | The same pipelines as GitHub Actions workflows, authenticating with OpenID Connect. |
-| `pipelines/scripts/` | Helpers the pipelines share: a retrying GitHub Releases client, the pinned Cimian tools installer, and the missing-package gate. |
+| `pipelines/azure/` | Azure DevOps pipelines: `push-to-production-*` (build catalogs + sync storage), `bootstrap-to-intune.yml` (the centerpiece), `autopkg.yml`, `promote-catalogs.yml` and `infrastructure.yml`. |
+| `pipelines/github/` | The same pipelines as GitHub Actions workflows, with actions pinned to commits and OIDC confined to protected environments. |
+| `pipelines/scripts/` | Helpers the pipelines share: a retrying GitHub Releases client, the hash-pinned Cimian tools installer, the missing-package gate, the blob sync and the Intune Win32 app publisher. |
+| `promotion/` | AutoPkg import and staged catalog promotion: pinned, trust-checked recipes, the promoter and its rules, and the checks that keep an import to the first stage. |
+| `infrastructure/` | Terraform for the storage account, Front Door and Key Vault behind the repo, with token-checked client access. |
 | `provisioning/` | The BootstrapMate first-boot manifest the bootstrap pipeline publishes. |
 | `preflight/cimian/` | A cimipkg sample that installs a Cimian preflight script run before each check. |
 | `local-caching/` | Service Bus / SQS commit-listener packages that keep on-prem caching servers in sync. |
@@ -41,6 +43,9 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | `enrollment/` | One consumer per downstream system. The Intune one builds the Entra group ladder everything else addresses. |
 | `intune/` | Renders three manifest keys the client ignores into Intune: Store apps, Settings Catalog and OMA-URI profiles, scripts. |
 | `pkgsinfo/apps/managed/` | One YAML source-of-truth descriptor for each managed Store app. |
+| `.github/` | CI for this repo: the offline tests, a parse of every script and pipeline, terraform validate, and the workflow pin and permission lint. |
+
+Every folder has its own README with the detail.
 
 ## Git hooks at a glance
 
@@ -126,7 +131,7 @@ to run. See [`enrollment/README.md`](enrollment/README.md#guards).
 
 Same architecture, different platform specifics:
 
-- Packages are `.nupkg` / `.msi` / `.exe`, architecture `x64`, built with [`cimipkg`](https://github.com/windowsadmins/cimian-pkg).
+- Packages are `.nupkg` / `.msi` / `.exe`, for `x64` and `arm64`, built with `cimipkg`. It ships with the Cimian tools and is developed at [cimian-pkg](https://github.com/windowsadmins/cimian-pkg).
 - Hooks are PowerShell (a small POSIX shim execs `pwsh` on the `.ps1`), so they run from Git Bash, WSL, or any `sh` Git ships on Windows.
 - `makecatalogs` emits a slightly different missing-installer warning; the hooks and the superseded resolver handle both dialects.
 - One condition genuinely differs. `machine_type == "laptop"` translates on macOS because Apple's marketing names carry the form factor, so it maps to a model-name prefix. Windows has no equivalent — "Surface Laptop" and "Surface Studio" share a prefix — so form factor comes from `deviceCategory`, and the linter says so rather than emitting a filter that would quietly match the wrong machines.
@@ -138,3 +143,7 @@ The macOS half of the same pattern is [munki-gitops](https://github.com/rodchris
 This repo accompanies the **MacDevOps YUL 2026** talk on running Windows and Mac fleets as code with MDM reduced to an approved delivery pipe.
 
 Questions or want to compare notes? Find me on [BlueSky](https://bsky.app/profile/rodchristiansen.net) or the [blog](https://blog.focused.systems).
+
+## License
+
+[MIT](LICENSE).

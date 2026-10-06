@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# HOOK_VERSION = '2026.06.25'
+# HOOK_VERSION = '2026.10.06'
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-merge.ps1  –  targeted package downloads after git pull/merge (Azure)
@@ -26,14 +26,15 @@ $ErrorActionPreference = 'Stop'
 $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 . (Join-Path (Join-Path $HookDir '..') 'lib\common.ps1')
 
-Test-HookVersion -HookName 'post-merge' -HookVersion '2026.06.25'
+Test-HookVersion -HookName 'post-merge' -HookVersion '2026.10.06'
 if (Test-ShouldSkipHook -HookName 'post-merge') { exit 0 }
+if (Test-SkipInLinkedWorktree -HookName 'post-merge') { exit 0 }
 Add-WorktreeCacheLink
 
 # ── Configuration ────────────────────────────────────────────────────────────
 $RepoRoot = Get-CimianRepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $HookDir '..\..')).Path }
-$Deployment = Join-Path $RepoRoot 'deployment'
+$Deployment = Get-CimianDeploymentRoot -RepoRoot $RepoRoot
 $PkgsDir    = Join-Path $Deployment 'pkgs'
 
 $StorageAccount = if ($env:CIMIAN_STORAGE_ACCOUNT) { $env:CIMIAN_STORAGE_ACCOUNT } else { 'yourstorageaccount' }
@@ -433,7 +434,7 @@ if ($changedPaths -eq 'force') {
     foreach ($sub in @('catalogs', 'pkgs', 'icons')) {
         Write-Log ">> force downloading deployment/$sub"
         & $AzCopyExe sync "$StorageUrl/deployment/$sub/" (Join-Path $Deployment $sub) `
-            --delete-destination=true --exclude-pattern='*.DS_Store' --log-level=INFO 2>&1 |
+            --delete-destination=true --exclude-pattern='.DS_Store;._*' --log-level=INFO 2>&1 |
             ForEach-Object { Add-Content -Path $LogFile -Value $_ }
     }
     Complete-Log
@@ -451,7 +452,7 @@ if ($changedPaths -eq 'sync') {
     Test-AzureAuth
     $env:AZCOPY_AUTO_LOGIN_TYPE = 'AZCLI'
     Write-Log '>> sync mode — full folder sync with MD5 comparison'
-    $syncOpts = @('--delete-destination=true', '--exclude-pattern=*.DS_Store', '--log-level=ERROR', '--output-level=essential')
+    $syncOpts = @('--delete-destination=true', '--exclude-pattern=.DS_Store;._*', '--log-level=ERROR', '--output-level=essential')
     if ($DryRun) { $syncOpts += '--dry-run' }
     foreach ($sub in @('catalogs', 'pkgs', 'icons')) {
         Write-Log ">> syncing deployment/$sub"
@@ -469,14 +470,14 @@ $env:AZCOPY_AUTO_LOGIN_TYPE = 'AZCLI'
 if ($changedPaths -match 'catalogs') {
     Write-Log '>> syncing deployment/catalogs'
     & $AzCopyExe sync "$StorageUrl/deployment/catalogs/" (Join-Path $Deployment 'catalogs') `
-        --exclude-pattern='*.DS_Store' --log-level=ERROR --output-level=essential 2>&1 |
+        --exclude-pattern='.DS_Store;._*' --log-level=ERROR --output-level=essential 2>&1 |
         ForEach-Object { Add-Content -Path $LogFile -Value $_ }
 }
 
 if ($changedPaths -match 'icons') {
     Write-Log '>> syncing deployment/icons'
     & $AzCopyExe sync "$StorageUrl/deployment/icons/" (Join-Path $Deployment 'icons') `
-        --exclude-pattern='*.DS_Store' --log-level=ERROR --output-level=essential 2>&1 |
+        --exclude-pattern='.DS_Store;._*' --log-level=ERROR --output-level=essential 2>&1 |
         ForEach-Object { Add-Content -Path $LogFile -Value $_ }
 }
 

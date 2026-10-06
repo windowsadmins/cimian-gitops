@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# HOOK_VERSION = '2026.06.25'
+# HOOK_VERSION = '2026.10.06'
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-merge.ps1  –  targeted package downloads after git pull/merge (AWS S3)
@@ -19,14 +19,15 @@ $ErrorActionPreference = 'Stop'
 $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 . (Join-Path (Join-Path $HookDir '..') 'lib\common.ps1')
 
-Test-HookVersion -HookName 'post-merge' -HookVersion '2026.06.25'
+Test-HookVersion -HookName 'post-merge' -HookVersion '2026.10.06'
 if (Test-ShouldSkipHook -HookName 'post-merge') { exit 0 }
+if (Test-SkipInLinkedWorktree -HookName 'post-merge') { exit 0 }
 Add-WorktreeCacheLink
 
 # ── Configuration ────────────────────────────────────────────────────────────
 $RepoRoot = Get-CimianRepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $HookDir '..\..')).Path }
-$Deployment = Join-Path $RepoRoot 'deployment'
+$Deployment = Get-CimianDeploymentRoot -RepoRoot $RepoRoot
 $PkgsDir    = Join-Path $Deployment 'pkgs'
 
 $S3Bucket = if ($env:CIMIAN_S3_BUCKET) { $env:CIMIAN_S3_BUCKET } else { 'your-cimian-bucket' }
@@ -349,7 +350,7 @@ if ($changedPaths -eq 'force') {
     foreach ($sub in @('catalogs', 'pkgs', 'icons')) {
         Write-Log ">> force downloading deployment/$sub"
         & $AwsExe s3 sync "$S3Url/deployment/$sub/" (Join-Path $Deployment $sub) `
-            --region $AwsRegion --delete --exclude '*.DS_Store' 2>&1 |
+            --region $AwsRegion --delete --exclude '*.DS_Store' --exclude '._*' --exclude '*/._*' 2>&1 |
             ForEach-Object { Add-Content -Path $LogFile -Value $_ }
     }
     Complete-Log
@@ -366,7 +367,7 @@ if ($changedPaths -eq 'sync') {
 
     Test-AwsAuth
     Write-Log '>> sync mode — aws s3 sync with ETag-based diff'
-    $syncOpts = @('--delete', '--exclude', '*.DS_Store', '--only-show-errors', '--region', $AwsRegion)
+    $syncOpts = @('--delete', '--exclude', '*.DS_Store', '--exclude', '._*', '--exclude', '*/._*', '--only-show-errors', '--region', $AwsRegion)
     if ($DryRun) { $syncOpts += '--dryrun' }
     foreach ($sub in @('catalogs', 'pkgs', 'icons')) {
         Write-Log ">> syncing deployment/$sub"
@@ -383,13 +384,13 @@ Test-AwsAuth
 if ($changedPaths -match 'catalogs') {
     Write-Log '>> syncing deployment/catalogs'
     & $AwsExe s3 sync "$S3Url/deployment/catalogs/" (Join-Path $Deployment 'catalogs') `
-        --region $AwsRegion --exclude '*.DS_Store' --only-show-errors 2>&1 |
+        --region $AwsRegion --exclude '*.DS_Store' --exclude '._*' --exclude '*/._*' --only-show-errors 2>&1 |
         ForEach-Object { Add-Content -Path $LogFile -Value $_ }
 }
 if ($changedPaths -match 'icons') {
     Write-Log '>> syncing deployment/icons'
     & $AwsExe s3 sync "$S3Url/deployment/icons/" (Join-Path $Deployment 'icons') `
-        --region $AwsRegion --exclude '*.DS_Store' --only-show-errors 2>&1 |
+        --region $AwsRegion --exclude '*.DS_Store' --exclude '._*' --exclude '*/._*' --only-show-errors 2>&1 |
         ForEach-Object { Add-Content -Path $LogFile -Value $_ }
 }
 if ($changedPaths -match 'pkgsinfo' -and $changedPkgsInfo.Count -gt 0) {

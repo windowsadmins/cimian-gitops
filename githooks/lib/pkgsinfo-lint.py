@@ -25,6 +25,7 @@ Catches problems `makecatalogs` silently accepts:
     * nopkg with no installcheck_script and no installs — install-loop trap
     * msi/exe/nupkg/pkg without nested installer location
     * Duplicate top-level keys (YAML silently drops all but the last)
+    * Installer-type wrappers with no installs[] and no installcheck_script
 """
 
 from __future__ import annotations
@@ -120,7 +121,36 @@ def _installer_descriptor(data: dict[str, Any]) -> tuple[str | None, dict[str, A
     return itype, installer_map
 
 
-def issues_for_file(path: Path) -> list[str]:
+def installer_type_products(repo_root: Path) -> set[str]:
+    """Names of cimipkg projects that build installer-type wrappers.
+
+    A cimipkg project with no install_location builds an "installer-type"
+    package: a hidden wrapper MSI (ARPSYSTEMCOMPONENT) with a fresh
+    ProductCode on every build, which runs an installer for some other app.
+    Detecting the wrapper is meaningless, so its pkgsinfo must describe the
+    wrapped app through installs[] or an installcheck_script, or Cimian
+    re-installs it every cycle. Projects live in installers/<name>/ and
+    packages/<name>/, each with a build-info.yaml.
+    """
+    names: set[str] = set()
+    for top in ("installers", "packages"):
+        base = repo_root / top
+        if not base.is_dir():
+            continue
+        for info in base.glob("*/build-info.yaml"):
+            try:
+                data = yaml.safe_load(info.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            product = data.get("product") if isinstance(data, dict) else None
+            name = product.get("name") if isinstance(product, dict) else None
+            location = data.get("install_location") if isinstance(data, dict) else None
+            if isinstance(name, str) and name.strip() and not (isinstance(location, str) and location.strip()):
+                names.add(name.strip())
+    return names
+
+
+def issues_for_file(path: Path, wrapper_names: set[str] | None = None) -> list[str]:
     """Validate one pkgsinfo file. Returns a list of error strings."""
     errors: list[str] = []
 
@@ -288,6 +318,17 @@ def issues_for_file(path: Path) -> list[str]:
                 f"Add an uninstallcheck_script that exits non-zero when already removed."
             )
 
+    # 11. Installer-type wrapper with no detection for the wrapped app.
+    name = data.get("name")
+    if wrapper_names and isinstance(name, str) and name in wrapper_names:
+        if not data.get("installs") and "installcheck_script" not in data:
+            errors.append(
+                f"'{name}' is built as an installer-type wrapper (no install_location "
+                f"in its build-info.yaml), but this pkgsinfo has no 'installs' and no "
+                f"'installcheck_script'. Cimian cannot see the wrapped app, so it "
+                f"re-installs every cycle. Describe the wrapped app in installs[]."
+            )
+
     return errors
 
 
@@ -357,10 +398,11 @@ def main() -> int:
     if not staged:
         return 0
 
+    wrappers = installer_type_products(repo_root)
     issues: list[tuple[str, list[str]]] = []
     for f in staged:
         rel = str(f.relative_to(repo_root)).replace("\\", "/")
-        errs = issues_for_file(f)
+        errs = issues_for_file(f, wrappers)
         if errs:
             issues.append((rel, errs))
 

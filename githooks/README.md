@@ -232,6 +232,18 @@ The two `makecatalogs` warning dialects are both handled by the hooks when grepp
 
 When bumping functionality that admins must have, bump `.min-version` and each hook's own `HOOK_VERSION` stamp in the same commit.
 
+## What the hooks trust, and what they upload
+
+A pkgsinfo `location` is data from a commit, so it is validated before it becomes a local path or a storage key. Drive letters, UNC and other absolute paths, `..` or empty segments and control characters are refused, and the resolved local path must stay under `deployment/pkgs`. One leading slash is accepted, since Cimian writes `/apps/Thing.msi` to mean "under pkgs". The same check covers downloads, orphan deletes, `--path` and the branch check.
+
+Uploads are limited to:
+
+- **`deployment/pkgs`**: only files referenced by tracked pkgsinfo, create-only. Untracked or ignored files in the local cache never leave the machine.
+- **`deployment/icons`**: image files only.
+- **`installers/<name>/payload` and `packages/<name>/payload`**: only for projects whose `build-info.yaml` is tracked. Sidecars and credential-shaped files (`.env`, `*.pem`, `*.key`, `*.pfx`, `*.p12`, `*.kdbx`, SSH keys) are excluded.
+
+No ACL is ever set, so objects inherit the container's or bucket's access (keep S3 Block Public Access on). Log lines are passed through a redactor that strips SAS and presigned-URL signatures and credentials.
+
 ## Tests
 
 ```sh

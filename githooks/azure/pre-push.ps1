@@ -95,7 +95,7 @@ Get-ChildItem -Path $LogDir -Filter 'hook-pre-push-upload-*.log' -ErrorAction Si
 
 function Write-Log {
     param([string]$Message)
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+    $line = Hide-UrlSecret "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
     Write-Host $line
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
@@ -168,9 +168,9 @@ function Get-CanonicalPkgList {
         ForEach-Object {
             $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
             if ($content -match '(?m)^\s+location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-                $set[($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')] = $true
+                $rel = ConvertTo-PkgRelativePath $Matches[1]; if ($rel) { $set[$rel] = $true }
             } elseif ($content -match '(?m)^installer_item_location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-                $set[($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')] = $true
+                $rel = ConvertTo-PkgRelativePath $Matches[1]; if ($rel) { $set[$rel] = $true }
             }
         }
     return $set.Keys
@@ -209,6 +209,7 @@ function Remove-AzureOrphan {
         if ($line -match '^INFO:') { continue }
         if ($line -match '^(.+?);') {
             $key = $Matches[1].Trim() -replace '\\', '/'
+            if (-not (ConvertTo-PkgRelativePath $key)) { continue }
             if ($key -match '\.(nupkg|msi|exe|zip|intunewin|pkg)$' -or (Test-IsSidecarName $key)) { $azureKeys += $key }
         }
     }
@@ -245,13 +246,13 @@ function Remove-AzureOrphan {
         Write-Log "Batch-deleting $($orphans.Count) orphans..."
         & $AzCopyExe remove "$StorageUrl/deployment/pkgs/" "--list-of-files=$batch" `
             --log-level=ERROR --output-level=essential 2>&1 |
-            Where-Object { $_ -notmatch '^INFO:' } | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+            Where-Object { $_ -notmatch '^INFO:' } | ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
         Remove-Item $batch -Force -ErrorAction SilentlyContinue
 
         $localDeleted = 0
         foreach ($o in $orphans) {
-            $lp = Join-Path $PkgsDir ($o -replace '/', '\')
-            if (Test-Path $lp) { Remove-Item $lp -Force -ErrorAction SilentlyContinue; $localDeleted++ }
+            $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $o
+            if ($lp -and (Test-Path -LiteralPath $lp)) { Remove-Item $lp -Force -ErrorAction SilentlyContinue; $localDeleted++ }
         }
         if ($localDeleted -gt 0) { Write-Log "  -> removed $localDeleted orphan(s) locally" }
     } else {
@@ -310,17 +311,34 @@ function Get-ChangedPaths {
 }
 
 # ── targeted path upload ─────────────────────────────────────────────────────
+# Only a package that tracked pkgsinfo references, or an image under
+# deployment/icons, and only by a validated path.
 if ($TargetPaths.Count -gt 0) {
     Write-Log ">> targeted path upload — $($TargetPaths.Count) path(s)"
     Test-AzureAuth
     $env:AZCOPY_AUTO_LOGIN_TYPE = 'AZCLI'
+    $tracked = @{}
+    foreach ($l in (Get-TrackedPkgLocation -RepoRoot $RepoRoot)) { $tracked[$l.ToLower()] = $true }
+    $iconsDir = Join-Path $Deployment 'icons'
     foreach ($t in $TargetPaths) {
-        $t = $t -replace '\\', '/'
-        if ($t -notlike 'deployment/*') { $t = "deployment/pkgs/$t" }
-        Write-Log "  -> uploading: $t"
-        & $AzCopyExe copy (Join-Path $RepoRoot ($t -replace '/', '\')) "$StorageUrl/$t" `
+        $t = ([string]$t) -replace '\\', '/'
+        if ($t -like 'deployment/icons/*') {
+            $name = ConvertTo-PkgRelativePath ($t.Substring('deployment/icons/'.Length))
+            $local = if ($name) { Resolve-PkgLocalPath -PkgsDir $iconsDir -RelPath $name } else { $null }
+            $isImage = $name -and @($script:IconPatterns | Where-Object { $name -like $_ }).Count -gt 0
+            if (-not $local -or -not $isImage) { Write-Log "  REFUSED: $t is not an image under deployment/icons"; continue }
+            $remote = "deployment/icons/$name"
+        } else {
+            $rel = ConvertTo-PkgRelativePath $t
+            $local = if ($rel) { Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $rel } else { $null }
+            if (-not $local) { Write-Log "  REFUSED: $t is not a safe path under deployment/pkgs"; continue }
+            if (-not $tracked.ContainsKey($rel.ToLower())) { Write-Log "  REFUSED: $rel is not referenced by tracked pkgsinfo"; continue }
+            $remote = "deployment/pkgs/$rel"
+        }
+        Write-Log "  -> uploading: $remote"
+        & $AzCopyExe copy $local "$StorageUrl/$remote" --overwrite=false `
             --put-md5 --log-level=ERROR --output-level=essential 2>&1 |
-            ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     }
     Write-Log 'Targeted path upload complete'
     Complete-Log
@@ -391,7 +409,7 @@ if (-not $makecatalogs) {
         foreach ($line in $missing) { $p = Get-MissingPkgPath -Line $line; if ($p) { $pathArgs += '--path'; $pathArgs += $p } }
 
         $postMerge = Join-Path $HookDir 'post-merge.ps1'
-        if (Test-Path $postMerge) { & pwsh -NoProfile -File $postMerge @pathArgs 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ } }
+        if (Test-Path $postMerge) { & pwsh -NoProfile -File $postMerge @pathArgs 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) } }
 
         # Re-validate.
         $tmp2 = [System.IO.Path]::GetTempFileName()
@@ -443,12 +461,22 @@ if (Test-PathIsReparsePoint $PkgsDir) {
     exit 1
 }
 
+# What leaves the machine, and nothing else:
+#   • deployment/pkgs: only files that tracked pkgsinfo reference, each by a
+#     validated path. Untracked or ignored files in the cache stay local.
+#   • deployment/icons: image files only.
+#   • installers/<name>/payload and packages/<name>/payload: only for projects
+#     whose build-info.yaml is tracked, minus sidecars and anything shaped
+#     like a credential or key (.env, *.pem, *.key, *.pfx, ...).
+# No ACL is ever set; objects inherit the container's access level.
+#
 # Additive only: no --delete-destination. Nobody holds all of deployment/pkgs
 # locally, so deleting what a partial cache lacks would empty the bucket. The
 # orphan cleanup is the one delete path. --put-md5 is REQUIRED: without it,
 # future syncs cannot compare hashes and re-transfer every file every time.
+$denyPattern = ($script:UploadDenyPatterns -join ';')
 $syncFlags = @(
-    "--exclude-pattern=$script:SidecarExcludePattern"
+    "--exclude-pattern=$denyPattern"
     '--put-md5'
     '--compare-hash=MD5'
     '--log-level=ERROR'
@@ -456,11 +484,32 @@ $syncFlags = @(
 )
 if ($DryRun) { $syncFlags += '--dry-run' }
 
-function Sync-Up([string]$Local, [string]$Remote) {
+function Sync-Up([string]$Local, [string]$Remote, [string[]]$Extra = @()) {
     if (-not (Test-Path -LiteralPath $Local)) { return }
     Write-Log ">> syncing $Remote"
-    & $AzCopyExe sync $Local "$StorageUrl/$Remote" @syncFlags 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+    & $AzCopyExe sync $Local "$StorageUrl/$Remote" @syncFlags @Extra 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     if ($LASTEXITCODE -ne 0) { Write-Log "ERROR: azcopy sync of $Remote failed ($LASTEXITCODE)"; Complete-Log; exit 1 }
+}
+
+# Packages are immutable: create-only, so an existing blob is never replaced.
+function Send-ReferencedPkgs {
+    $rels = @(Get-TrackedPkgLocation -RepoRoot $RepoRoot | Where-Object {
+        $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $_
+        $lp -and (Test-Path -LiteralPath $lp -PathType Leaf) -and -not (Test-IsSidecarName $_)
+    })
+    if ($rels.Count -eq 0) { Write-Log 'No referenced packages present locally to upload'; return }
+    Write-Log ">> uploading up to $($rels.Count) referenced package(s) to deployment/pkgs (create-only)"
+    if ($DryRun) { $rels | ForEach-Object { Write-Log "  [DRY RUN] $_" }; return }
+    $list = [IO.Path]::GetTempFileName()
+    try {
+        Set-Content -LiteralPath $list -Value $rels -Encoding UTF8
+        & $AzCopyExe copy $PkgsDir "$StorageUrl/deployment/pkgs" --recursive --as-subdir=false `
+            "--list-of-files=$list" --overwrite=false --put-md5 --log-level=ERROR --output-level=essential 2>&1 |
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
+        if ($LASTEXITCODE -ne 0) { Write-Log "ERROR: package upload failed ($LASTEXITCODE)"; Complete-Log; exit 1 }
+    } finally {
+        Remove-Item -LiteralPath $list -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # installers/<name>/payload and packages/<name>/payload are the source trees
@@ -471,6 +520,9 @@ function Sync-Payloads {
         $topDir = Join-Path $RepoRoot $top
         if (-not (Test-Path -LiteralPath $topDir)) { continue }
         foreach ($item in Get-ChildItem -LiteralPath $topDir -Directory -ErrorAction SilentlyContinue) {
+            if ($item.Name -match '[^A-Za-z0-9._ -]' -or $item.Name.StartsWith('.')) { continue }
+            git -C $RepoRoot ls-files --error-unmatch -- "$top/$($item.Name)/build-info.yaml" 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Log "  skip $top/$($item.Name): build-info.yaml is not tracked"; continue }
             $payload = Join-Path $item.FullName 'payload'
             if (Test-Path -LiteralPath $payload) { Sync-Up $payload "$top/$($item.Name)/payload/" }
         }
@@ -478,8 +530,8 @@ function Sync-Payloads {
 }
 
 $all = $changedPaths -in @('all', 'upload')
-if ($all -or $changedPaths -match 'pkgs')     { Sync-Up $PkgsDir 'deployment/pkgs/' }
-if ($all -or $changedPaths -match 'icons')    { Sync-Up (Join-Path $Deployment 'icons') 'deployment/icons/' }
+if ($all -or $changedPaths -match 'pkgs')     { Send-ReferencedPkgs }
+if ($all -or $changedPaths -match 'icons')    { Sync-Up (Join-Path $Deployment 'icons') 'deployment/icons/' @("--include-pattern=$($script:IconPatterns -join ';')") }
 if ($all -or $changedPaths -match 'payloads') { Sync-Payloads }
 if ($all -or $changedPaths -match 'pkgs')     { Remove-AzureOrphan }
 if ($all) { Remove-ImportedBuildArtifact -RepoRoot $RepoRoot -PkgsDir $PkgsDir -DryRun:$DryRun }

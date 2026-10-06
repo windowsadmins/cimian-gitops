@@ -82,7 +82,7 @@ Get-ChildItem -Path $LogDir -Filter 'hook-post-merge-download-*.log' -ErrorActio
 
 function Write-Log {
     param([string]$Message)
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+    $line = Hide-UrlSecret "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
     Write-Host $line
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
@@ -153,10 +153,14 @@ function Get-InstallerLocation {
     $content = Get-Content $PkgsInfoFile -Raw -ErrorAction SilentlyContinue
     if (-not $content) { return '' }
     if ($content -match '(?m)^\s+location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-        return ($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')
+        $rel = ConvertTo-PkgRelativePath $Matches[1]
+        if (-not $rel) { Write-Log "WARNING: ignoring unsafe installer location '$($Matches[1])' in $PkgsInfoFile"; return '' }
+        return $rel
     }
     if ($content -match '(?m)^installer_item_location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-        return ($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')
+        $rel = ConvertTo-PkgRelativePath $Matches[1]
+        if (-not $rel) { Write-Log "WARNING: ignoring unsafe installer location '$($Matches[1])' in $PkgsInfoFile"; return '' }
+        return $rel
     }
     return ''
 }
@@ -209,7 +213,7 @@ function Remove-OrphanPackage {
     }
     foreach ($o in $orphans) {
         Write-Log "  orphan: $o"
-        if (-not $DryRun) { Remove-Item (Join-Path $PkgsDir ($o -replace '/', '\')) -Force -ErrorAction SilentlyContinue }
+        if (-not $DryRun) { $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $o; if ($lp) { Remove-Item -LiteralPath $lp -Force -ErrorAction SilentlyContinue } }
     }
     Write-Log "Cleaned up $($orphans.Count) orphan package(s)"
 }
@@ -230,9 +234,11 @@ function Invoke-CacheFirstDownload {
     $s3Batch = @()
     $total = 0; $cacheHits = 0
     foreach ($rel in $RelPaths) {
-        if (-not $rel) { continue }
+        $rel = ConvertTo-PkgRelativePath $rel
+        if (-not $rel) { Write-Log '  WARNING: skipping an unsafe package path'; continue }
+        $dest = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $rel
+        if (-not $dest) { Write-Log "  WARNING: $rel resolves outside deployment/pkgs, skipping"; continue }
         $total++
-        $dest = Join-Path $PkgsDir ($rel -replace '/', '\')
         $parent = Split-Path -Parent $dest
         if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
 
@@ -252,10 +258,10 @@ function Invoke-CacheFirstDownload {
         Write-Log ">> downloading $($s3Batch.Count) file(s) from S3"
         foreach ($rel in $s3Batch) {
             $src = "$S3Url/deployment/pkgs/$rel"
-            $dst = Join-Path $PkgsDir ($rel -replace '/', '\')
+            $dst = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $rel
             $out = & $AwsExe s3 cp $src $dst --region $AwsRegion --only-show-errors 2>&1
             if ($LASTEXITCODE -ne 0) { Write-Log "  WARNING: Failed to download $rel" }
-            if ("$out".Trim()) { Add-Content -Path $LogFile -Value ($out | Out-String) }
+            if ("$out".Trim()) { Add-Content -Path $LogFile -Value (Hide-UrlSecret ($out | Out-String)) }
         }
     }
     Write-Log "  Cache hits: $cacheHits / $total - S3 batch: $($s3Batch.Count)"
@@ -351,7 +357,7 @@ if ($changedPaths -eq 'force') {
         Write-Log ">> force downloading deployment/$sub"
         & $AwsExe s3 sync "$S3Url/deployment/$sub/" (Join-Path $Deployment $sub) `
             --region $AwsRegion --delete --exclude '*.DS_Store' --exclude '._*' --exclude '*/._*' 2>&1 |
-            ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     }
     Complete-Log
     exit 0
@@ -372,7 +378,7 @@ if ($changedPaths -eq 'sync') {
     foreach ($sub in @('catalogs', 'pkgs', 'icons')) {
         Write-Log ">> syncing deployment/$sub"
         & $AwsExe s3 sync "$S3Url/deployment/$sub/" (Join-Path $Deployment $sub) @syncOpts 2>&1 |
-            ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     }
     Complete-Log
     exit 0
@@ -385,13 +391,13 @@ if ($changedPaths -match 'catalogs') {
     Write-Log '>> syncing deployment/catalogs'
     & $AwsExe s3 sync "$S3Url/deployment/catalogs/" (Join-Path $Deployment 'catalogs') `
         --region $AwsRegion --exclude '*.DS_Store' --exclude '._*' --exclude '*/._*' --only-show-errors 2>&1 |
-        ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+        ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
 }
 if ($changedPaths -match 'icons') {
     Write-Log '>> syncing deployment/icons'
     & $AwsExe s3 sync "$S3Url/deployment/icons/" (Join-Path $Deployment 'icons') `
         --region $AwsRegion --exclude '*.DS_Store' --exclude '._*' --exclude '*/._*' --only-show-errors 2>&1 |
-        ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+        ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
 }
 if ($changedPaths -match 'pkgsinfo' -and $changedPkgsInfo.Count -gt 0) {
     Write-Log '>> extracting installer location from changed pkgsinfo'

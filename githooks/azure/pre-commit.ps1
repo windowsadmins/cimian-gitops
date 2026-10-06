@@ -169,11 +169,11 @@ if ($currentBranch -in @('main', 'master')) {
             ForEach-Object {
                 $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
                 if ($content -match '(?m)^\s+location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-                    $loc = ($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')
-                    $canonical[$loc.ToLower()] = $true
+                    $loc = ConvertTo-PkgRelativePath $Matches[1]
+                    if ($loc) { $canonical[$loc.ToLower()] = $true }
                 } elseif ($content -match '(?m)^installer_item_location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-                    $loc = ($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')
-                    $canonical[$loc.ToLower()] = $true
+                    $loc = ConvertTo-PkgRelativePath $Matches[1]
+                    if ($loc) { $canonical[$loc.ToLower()] = $true }
                 }
             }
 
@@ -209,7 +209,8 @@ if ($currentBranch -in @('main', 'master')) {
                 Write-Host "Found $($orphans.Count) orphan package(s) — cleaning up:"
                 foreach ($o in $orphans) {
                     Write-Host "  - $o"
-                    Remove-Item (Join-Path $PkgsDir ($o -replace '/', '\')) -Force -ErrorAction SilentlyContinue
+                    $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $o
+                    if ($lp) { Remove-Item -LiteralPath $lp -Force -ErrorAction SilentlyContinue }
                 }
                 Write-Host ''
             }

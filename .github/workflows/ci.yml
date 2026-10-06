@@ -35,6 +35,8 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Promotion tests
         run: python -m unittest discover -s promotion/tests -v
+      - name: Quality tests
+        run: python -m unittest discover -s quality/tests -v
       - name: Inventory projection
         run: |
           python inventory/projections/project.py inventory/inventory.csv --out-dir "$RUNNER_TEMP/out"
@@ -80,6 +82,14 @@ jobs:
             if ($errors) { $bad++; $errors | ForEach-Object { Write-Host "::error file=$($_.Extent.File),line=$($_.Extent.StartLineNumber)::$($_.Message)" } }
           }
           if ($bad) { throw "$bad script(s) failed to parse" }
+      - name: Quality lint tests
+        shell: pwsh
+        run: |
+          Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          pwsh -NoProfile -File quality/tests/Test-Lints.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'quality lint tests failed' }
       - name: Git hook tests
         shell: pwsh
         run: |

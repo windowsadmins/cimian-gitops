@@ -1,0 +1,80 @@
+# prod-checks.yml — GitHub Actions twin of ../azure/prod-checks.yml.
+#
+# A weekday read-only check: quality lints over the whole pkgsinfo tree,
+# hand-made items that never reached Production, and catalog drift between
+# recent pkgsinfo and the catalogs clients actually download. Findings are
+# warnings, never failures.
+#
+# The drift job logs in with OIDC from a protected environment whose
+# federated credential has only Storage Blob Data Reader on the container.
+
+name: Production checks
+
+on:
+  schedule:
+    - cron: '0 15 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  STORAGE_ACCOUNT: ${{ vars.STORAGE_ACCOUNT }}
+  STORAGE_CONTAINER: ${{ vars.STORAGE_CONTAINER }}
+  DRIFT_DAYS: '4'
+
+jobs:
+  repo-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyyaml
+      - name: Quality lints
+        shell: pwsh
+        run: |
+          Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber
+          pwsh -NoProfile -File quality/lint/Test-Categories.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Host '::warning::Category check failed' }
+          pwsh -NoProfile -File quality/lint/Test-PkgsinfoStructure.ps1 -Path deployment/pkgsinfo
+          if ($LASTEXITCODE -ne 0) { Write-Host '::warning::Structure check failed' }
+          exit 0
+      - name: Items not in Production
+        run: python quality/prod_checks.py stalled --repo .
+
+  drift:
+    runs-on: ubuntu-latest
+    environment: cimian-readonly
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyyaml
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Catalog drift
+        run: |
+          set -uo pipefail
+          dest="$RUNNER_TEMP/published-catalogs"
+          mkdir -p "$dest"
+          for cat in Development Testing Staging Production; do
+            az storage blob download --auth-mode login \
+              --account-name "$STORAGE_ACCOUNT" --container-name "$STORAGE_CONTAINER" \
+              --name "deployment/catalogs/$cat.yaml" --file "$dest/$cat.yaml" \
+              --overwrite --no-progress -o none 2>/dev/null || echo "note: no published $cat catalog"
+          done
+          python quality/prod_checks.py drift --repo . --published "$dest" --days "$DRIFT_DAYS"

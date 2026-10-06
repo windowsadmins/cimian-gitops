@@ -1,0 +1,13 @@
+Identifier: local.cimian.Chrome
+Input:
+  ARCHITECTURE: x64
+  DOWNLOAD_URL: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi
+  NAME: Chrome
+ParentRecipe: com.github.autopkg.cimian.Chrome
+ParentRecipeTrustInfo:
+  non_core_processors: {}
+  parent_recipes:
+    com.github.autopkg.cimian.Chrome:
+      git_hash: 0bf346b7b654100d1f3b806eff7b05f7a9c5249d
+      path: ~/RecipeRepos/com.github.windowsadmins.autopkg-recipes/Chrome/Chrome.cimian.recipe.yaml
+      sha256_hash: f8823c771682160853cc0c7b2b7bab44e3d8acd14d19e35b541dc4d2714bc568

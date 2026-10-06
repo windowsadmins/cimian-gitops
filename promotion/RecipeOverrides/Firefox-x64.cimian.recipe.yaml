@@ -1,0 +1,13 @@
+Identifier: local.cimian.Firefox-x64
+Input:
+  ARCHITECTURE: x64
+  DOWNLOAD_URL: https://download.mozilla.org/?product=firefox-msi-latest-ssl&os=win64&lang=en-US
+  NAME: Firefox
+ParentRecipe: com.github.autopkg.cimian.Firefox-x64
+ParentRecipeTrustInfo:
+  non_core_processors: {}
+  parent_recipes:
+    com.github.autopkg.cimian.Firefox-x64:
+      git_hash: 0bf346b7b654100d1f3b806eff7b05f7a9c5249d
+      path: ~/RecipeRepos/com.github.windowsadmins.autopkg-recipes/Firefox/Firefox-x64.cimian.recipe.yaml
+      sha256_hash: de9e0fee4c4c2857ee6fa873b2b6d31cb998b569a0c751b790209c2ff8131e67

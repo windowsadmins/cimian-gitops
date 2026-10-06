@@ -1,14 +1,22 @@
 # autopkg.yml — GitHub Actions twin of ../azure/autopkg.yml.
 #
-# Runs the recipes in promotion/recipe_list.yaml, stamps the new pkgsinfo for
-# the promoter, uploads the packages add-only to Azure Blob, and commits the
-# pkgsinfo to main. Storage auth is OpenID Connect (see push-to-production-azure.yml
-# for the federated credential). For S3, swap the login and upload steps for
-# aws-actions/configure-aws-credentials and `aws s3 sync deployment/pkgs ...`
-# without --delete.
+# Recipes run third-party code, so the run is two jobs and only the second
+# holds a write credential:
 #
-# The commit is pushed with GITHUB_TOKEN, which does not start other
-# workflows. Use a GitHub App token if push-to-production should run on it
+#   import   contents: read, no persisted git credential, no cloud login, and
+#            a separate read-only token (secret AUTOPKG_GITHUB_TOKEN) for
+#            AutoPkg's GitHub downloads, never the job's own GITHUB_TOKEN.
+#            Runs the pinned, trust-checked recipes, stamps and checks the
+#            output, and uploads it as an artifact.
+#   publish  contents: write and id-token: write. Checks the artifact again,
+#            applies it to a clean checkout of main, uploads the packages
+#            add-only to Azure Blob over OIDC, and commits the pkgsinfo.
+#
+# For S3, swap the login and upload for aws-actions/configure-aws-credentials
+# and `aws s3 sync deployment/pkgs ...` without --delete.
+#
+# A push made with GITHUB_TOKEN does not start other workflows. Use a GitHub
+# App token in the publish job if push-to-production should run on the commit
 # without a manual dispatch.
 
 name: AutoPkg
@@ -27,38 +35,40 @@ concurrency:
   group: autopkg
   cancel-in-progress: false
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
 
 env:
-  STORAGE_ACCOUNT: ${{ vars.STORAGE_ACCOUNT }}
-  STORAGE_CONTAINER: ${{ vars.STORAGE_CONTAINER }}
   CIMIAN_TOOLS_TAG: '2026.09.18.1356'
   CIMIAN_TOOLS_SHA256: 'e6824a09095e4d1f86cff99469bb96f49b5b597fdbbab157139e97b933b73f71'
 
 jobs:
-  autopkg:
+  import:
     runs-on: windows-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      recipes_failed: ${{ steps.run.outputs.failed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
       - name: Install cimiimport
         shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.AUTOPKG_GITHUB_TOKEN }}
         run: ./pipelines/scripts/Install-CimianTools.ps1 -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination "$env:RUNNER_TEMP/cimian-tools" -Tools cimiimport.exe
 
       - name: Run AutoPkg
         id: run
         shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          AUTOPKG_GITHUB_TOKEN: ${{ secrets.AUTOPKG_GITHUB_TOKEN }}
           RECIPES: ${{ inputs.recipes }}
         run: |
           $recipes = @($env:RECIPES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -69,37 +79,94 @@ jobs:
           }
           if ($recipes) { $params.Recipes = $recipes }
           ./promotion/Invoke-AutoPkgRun.ps1 @params
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host '::warning::Some recipes failed'
-            "failed=true" | Out-File -Append $env:GITHUB_OUTPUT
-          }
+          $failed = if ($LASTEXITCODE -ne 0) { 'true' } else { 'false' }
+          if ($failed -eq 'true') { Write-Host '::warning::Some recipes failed' }
+          "failed=$failed" | Out-File -Append $env:GITHUB_OUTPUT
           exit 0
 
-      - name: Stamp metadata
-        id: stamp
+      - name: Stamp, check and stage
         shell: pwsh
         run: |
-          python promotion/stamp_metadata.py --repo $env:GITHUB_WORKSPACE
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_WORKSPACE
+          python promotion/stamp_metadata.py --repo $repo
           if ($LASTEXITCODE -ne 0) { throw 'stamp_metadata failed' }
+          python promotion/check_import.py --repo $repo
+          if ($LASTEXITCODE -ne 0) { throw 'Import output failed the checks' }
+          $out = Join-Path $env:RUNNER_TEMP 'import'
+          New-Item -ItemType Directory -Force -Path (Join-Path $out 'deployment') | Out-Null
+          if (Test-Path deployment/pkgs) { Copy-Item -Path deployment/pkgs -Destination (Join-Path $out 'deployment') -Recurse }
+          foreach ($line in (git status --porcelain --untracked-files=all -- deployment/pkgsinfo)) {
+            if ($line.Substring(0, 2).Trim() -like 'D*') { continue }
+            $rel = $line.Substring(3).Trim('"')
+            $dest = Join-Path $out $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+            Copy-Item -LiteralPath $rel -Destination $dest
+          }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autopkg-import
+          path: ${{ runner.temp }}/import
+          if-no-files-found: ignore
+          retention-days: 3
+
+  publish:
+    needs: import
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      STORAGE_ACCOUNT: ${{ vars.STORAGE_ACCOUNT }}
+      STORAGE_CONTAINER: ${{ vars.STORAGE_CONTAINER }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: autopkg-import
+          path: ${{ runner.temp }}/import
+
+      - name: Check and apply the import
+        id: apply
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --quiet --require-hashes --only-binary=:all: -r promotion/requirements-autopkg.txt
+          # The artifact came from a job that ran recipe code: check it before
+          # it touches the checkout, and again once it has.
+          $art = Join-Path $env:RUNNER_TEMP 'import'
+          python promotion/check_import.py --artifact $art
+          if ($LASTEXITCODE -ne 0) { throw 'Artifact failed the checks' }
+          if (Test-Path (Join-Path $art 'deployment')) { Copy-Item -Path (Join-Path $art 'deployment') -Destination $env:GITHUB_WORKSPACE -Recurse -Force }
+          python promotion/check_import.py --repo $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { throw 'Import output failed the checks' }
           git add -A deployment/pkgsinfo
           git diff --cached --quiet
           "imports=$($LASTEXITCODE -ne 0)" | Out-File -Append $env:GITHUB_OUTPUT
 
       - name: Azure login (OIDC)
-        if: steps.stamp.outputs.imports == 'True'
-        uses: azure/login@v2
+        if: steps.apply.outputs.imports == 'True'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Upload new packages
-        if: steps.stamp.outputs.imports == 'True'
+        if: steps.apply.outputs.imports == 'True'
         shell: pwsh
         run: ./pipelines/scripts/Sync-RepoToBlob.ps1 -StorageAccount $env:STORAGE_ACCOUNT -Container $env:STORAGE_CONTAINER -RepoRoot $env:GITHUB_WORKSPACE -PackagesOnly
 
       - name: Commit imports
-        if: steps.stamp.outputs.imports == 'True'
+        if: steps.apply.outputs.imports == 'True'
         shell: pwsh
         run: |
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -113,6 +180,6 @@ jobs:
           throw 'Could not push the import commit'
 
       - name: Fail if any recipe failed
-        if: steps.run.outputs.failed == 'true'
+        if: needs.import.outputs.recipes_failed == 'true'
         shell: pwsh
-        run: throw 'One or more recipes failed; see the Run AutoPkg step.'
+        run: throw 'One or more recipes failed; see the import job.'

@@ -1,0 +1,12 @@
+Identifier: local.cimian.7-Zip-arm64
+Input:
+  ARCHITECTURE: arm64
+  NAME: 7-Zip
+ParentRecipe: com.github.autopkg.cimian.7-Zip-arm64
+ParentRecipeTrustInfo:
+  non_core_processors: {}
+  parent_recipes:
+    com.github.autopkg.cimian.7-Zip-arm64:
+      git_hash: 0bf346b7b654100d1f3b806eff7b05f7a9c5249d
+      path: ~/RecipeRepos/com.github.windowsadmins.autopkg-recipes/7-Zip/7-Zip-arm64.cimian.recipe.yaml
+      sha256_hash: f0071fe9a9edf97162a5282dcf7b5e6363807646937d558602ab6b6cef9889ec

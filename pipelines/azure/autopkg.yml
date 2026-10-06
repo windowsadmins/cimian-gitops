@@ -1,15 +1,21 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  autopkg.yml — import new app versions with AutoPkg, every weekday morning.
 #
-#  1. Run the recipes in promotion/recipe_list.yaml with the Cimian-aware
-#     AutoPkg fork. New installers land in deployment/pkgs, new pkgsinfo in
-#     deployment/pkgsinfo, in the catalogs the recipe or its override sets.
-#  2. Stamp _metadata.created_by: autopkg on the new pkgsinfo, which is what
-#     makes promote-catalogs.yml move them on later.
-#  3. Upload the packages, add-only, so they are in storage before anything
-#     references them.
-#  4. Commit the pkgsinfo to main. push-to-production then rebuilds the
-#     catalogs, and its missing-package gate double-checks step 3.
+#  Recipes run third-party download and processing code, so the run is split
+#  in two jobs and only the second holds any write credential:
+#
+#  import   No service connection, no persisted git credential, and only a
+#           read-only GitHub token. Runs the pinned, trust-checked recipes in
+#           promotion/recipe_list.yaml, stamps the new pkgsinfo for the
+#           promoter, checks the output with promotion/check_import.py, and
+#           publishes the new pkgsinfo and packages as an artifact.
+#  publish  Checks the artifact again (it was produced by untrusted code),
+#           copies it into a clean checkout of main, uploads the packages
+#           add-only, and commits the pkgsinfo. push-to-production then
+#           rebuilds the catalogs from main.
+#
+#  Imports land only in the first-stage catalogs; check_import.py fails the
+#  run otherwise. Moving on from there is promote-catalogs.yml.
 #
 #  Scripts read pipeline variables from the environment ($env:NAME), never as
 #  $(NAME) macros pasted into script text.
@@ -34,25 +40,94 @@ pool:
   vmImage: windows-latest
 
 variables:
-  - group: cimian-repo-secrets            # GitHubReadToken (public-repo read)
+  # AutoPkgGitHubToken: a fine-grained token with public-repo read only. It is
+  # the one secret the import job sees, and recipes can read it.
+  - group: cimian-autopkg-read
   - name: azureServiceConnection          # workload identity federation
     value: '<ado-service-connection>'
   - name: STORAGE_ACCOUNT
     value: 'examplecimianstorage'
   - name: STORAGE_CONTAINER
     value: 'repo'
-  # Keep in step with push-to-production: catalogs built with different
-  # makecatalogs rules than the ones that ship can disagree about duplicates.
   - name: CIMIAN_TOOLS_TAG
     value: '2026.09.18.1356'
   - name: CIMIAN_TOOLS_SHA256
     value: 'e6824a09095e4d1f86cff99469bb96f49b5b597fdbbab157139e97b933b73f71'
-  - name: TOOLS_DIR
-    value: '$(Agent.TempDirectory)/cimian-tools'
 
 jobs:
-- job: autopkg
+- job: import
   timeoutInMinutes: 120
+  steps:
+  - checkout: self
+    clean: true
+    persistCredentials: false
+    fetchDepth: 1
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.12'
+
+  - pwsh: |
+      $tools = Join-Path $env:AGENT_TEMPDIRECTORY 'cimian-tools'
+      & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Install-CimianTools.ps1') `
+        -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination $tools -Tools cimiimport.exe
+    displayName: Install cimiimport
+    env:
+      GITHUB_TOKEN: $(AutoPkgGitHubToken)
+
+  - pwsh: |
+      $recipes = @($env:RECIPES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      $params = @{
+        RepoRoot       = $env:BUILD_SOURCESDIRECTORY
+        CimiimportPath = Join-Path $env:AGENT_TEMPDIRECTORY 'cimian-tools/cimiimport.exe'
+        WorkDir        = Join-Path $env:AGENT_TEMPDIRECTORY 'autopkg'
+      }
+      if ($recipes) { $params.Recipes = $recipes }
+      & (Join-Path $env:BUILD_SOURCESDIRECTORY 'promotion/Invoke-AutoPkgRun.ps1') @params
+      # Publish what did import; the publish job ends red if anything failed.
+      $failed = if ($LASTEXITCODE -ne 0) { 'true' } else { 'false' }
+      if ($failed -eq 'true') { Write-Host '##vso[task.logissue type=warning]Some recipes failed' }
+      Write-Host "##vso[task.setvariable variable=recipesFailed;isOutput=true]$failed"
+    name: run
+    displayName: Run AutoPkg
+    env:
+      RECIPES: ${{ parameters.recipes }}
+      AUTOPKG_GITHUB_TOKEN: $(AutoPkgGitHubToken)
+
+  - pwsh: |
+      $ErrorActionPreference = 'Stop'
+      $repo = $env:BUILD_SOURCESDIRECTORY
+      python -m pip install --quiet --require-hashes --only-binary=:all: -r promotion/requirements-autopkg.txt
+      python promotion/stamp_metadata.py --repo $repo
+      if ($LASTEXITCODE -ne 0) { throw 'stamp_metadata failed' }
+      python promotion/check_import.py --repo $repo
+      if ($LASTEXITCODE -ne 0) { throw 'Import output failed the checks' }
+
+      # Stage new and changed pkgsinfo, and the packages, keeping their paths.
+      # Packages are not in git (or are ignored), so everything under
+      # deployment/pkgs on this fresh agent came from this run.
+      $out = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'import'
+      New-Item -ItemType Directory -Force -Path (Join-Path $out 'deployment') | Out-Null
+      $pkgs = Join-Path $repo 'deployment/pkgs'
+      if (Test-Path $pkgs) { Copy-Item -Path $pkgs -Destination (Join-Path $out 'deployment') -Recurse }
+      $changed = git -C $repo status --porcelain --untracked-files=all -- deployment/pkgsinfo
+      foreach ($line in $changed) {
+        if ($line.Substring(0, 2).Trim() -like 'D*') { continue }
+        $rel = $line.Substring(3).Trim('"')
+        $dest = Join-Path $out $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repo $rel) -Destination $dest
+      }
+      Write-Host "Staged $(@(Get-ChildItem $out -Recurse -File).Count) file(s)"
+    displayName: Stamp, check and stage
+
+  - publish: $(Build.ArtifactStagingDirectory)/import
+    artifact: autopkg-import
+
+- job: publish
+  dependsOn: import
+  variables:
+    recipesFailed: $[ dependencies.import.outputs['run.recipesFailed'] ]
   steps:
   - checkout: self
     clean: true
@@ -63,46 +138,27 @@ jobs:
     inputs:
       versionSpec: '3.12'
 
+  - download: current
+    artifact: autopkg-import
+
   - pwsh: |
-      git config user.email 'pipeline@example.com'
-      git config user.name 'Cimian AutoPkg'
-      git fetch origin main --depth=1
+      $ErrorActionPreference = 'Stop'
+      $repo = $env:BUILD_SOURCESDIRECTORY
+      $art = Join-Path $env:PIPELINE_WORKSPACE 'autopkg-import'
+      python -m pip install --quiet pyyaml
+      # The artifact came from a job that ran recipe code: check it again
+      # before it touches the checkout, and again once it has.
+      python promotion/check_import.py --artifact $art
+      if ($LASTEXITCODE -ne 0) { throw 'Artifact failed the checks' }
+      git fetch --quiet origin main --depth=1
       git switch -C main origin/main
-      & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Install-CimianTools.ps1') `
-        -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination $env:TOOLS_DIR -Tools cimiimport.exe
-    displayName: Sync main and install cimiimport
-    env:
-      GITHUB_TOKEN: $(GitHubReadToken)
-
-  - pwsh: |
-      $recipes = @($env:RECIPES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-      $params = @{
-        RepoRoot       = $env:BUILD_SOURCESDIRECTORY
-        CimiimportPath = Join-Path $env:TOOLS_DIR 'cimiimport.exe'
-        WorkDir        = Join-Path $env:AGENT_TEMPDIRECTORY 'autopkg'
-      }
-      if ($recipes) { $params.Recipes = $recipes }
-      & (Join-Path $env:BUILD_SOURCESDIRECTORY 'promotion/Invoke-AutoPkgRun.ps1') @params
-      if ($LASTEXITCODE -ne 0) {
-        # Keep going so the recipes that did import are published; the run
-        # still ends red (see the last step).
-        Write-Host "##vso[task.logissue type=warning]Some recipes failed"
-        Write-Host "##vso[task.setvariable variable=RECIPES_FAILED]true"
-      }
-    displayName: Run AutoPkg
-    env:
-      RECIPES: ${{ parameters.recipes }}
-      GITHUB_TOKEN: $(GitHubReadToken)
-
-  - pwsh: |
-      python promotion/stamp_metadata.py --repo $env:BUILD_SOURCESDIRECTORY
-      if ($LASTEXITCODE -ne 0) { throw 'stamp_metadata failed' }
+      if (Test-Path (Join-Path $art 'deployment')) { Copy-Item -Path (Join-Path $art 'deployment') -Destination $repo -Recurse -Force }
+      python promotion/check_import.py --repo $repo
+      if ($LASTEXITCODE -ne 0) { throw 'Import output failed the checks' }
       git add -A deployment/pkgsinfo
       git diff --cached --quiet
-      $changed = $LASTEXITCODE -ne 0
-      Write-Host "##vso[task.setvariable variable=HAS_IMPORTS]$changed"
-      Write-Host "New or changed pkgsinfo: $changed"
-    displayName: Stamp metadata
+      Write-Host "##vso[task.setvariable variable=HAS_IMPORTS]$($LASTEXITCODE -ne 0)"
+    displayName: Check and apply the import
 
   - task: AzureCLI@2
     displayName: Upload new packages
@@ -117,6 +173,8 @@ jobs:
           -RepoRoot $env:BUILD_SOURCESDIRECTORY -PackagesOnly
 
   - pwsh: |
+      git config user.email 'pipeline@example.com'
+      git config user.name 'Cimian AutoPkg'
       git commit -qm "AutoPkg imports $(Get-Date -AsUTC -Format yyyy-MM-dd)"
       foreach ($try in 1..3) {
         git pull --rebase -q origin main
@@ -127,6 +185,6 @@ jobs:
     displayName: Commit imports
     condition: and(succeeded(), eq(variables['HAS_IMPORTS'], 'True'))
 
-  - pwsh: throw 'One or more recipes failed; see the Run AutoPkg step.'
+  - pwsh: throw 'One or more recipes failed; see the import job.'
     displayName: Fail if any recipe failed
-    condition: and(succeeded(), eq(variables['RECIPES_FAILED'], 'true'))
+    condition: and(succeeded(), eq(variables['recipesFailed'], 'true'))

@@ -11,8 +11,6 @@ Fails when:
   - a job with id-token: write has no `environment:`. The environment is what
     the federated credential trusts, and where reviewers or branch rules stop
     an edited workflow from minting a token.
-
-intune/pipelines/github/ is left out while that layer moves to its own repo.
 """
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ import sys
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-GLOBS = [".github/workflows/*.yml", "pipelines/github/*.yml"]
+GLOBS = [".github/workflows/*.yml", "pipelines/github/*.yml", "intune/pipelines/github/*.yml"]
 PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
 
 

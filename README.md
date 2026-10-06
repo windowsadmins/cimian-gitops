@@ -42,8 +42,8 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | `preflight/cimian/` | A cimipkg sample that installs a Cimian preflight script run before each check. |
 | `local-caching/` | Service Bus / SQS commit-listener packages that keep on-prem caching servers in sync. |
 | `inventory/` | The twelve-column device contract, a sample fleet, and the projection script that narrows it per system. |
-| `enrollment/` | One consumer per downstream system. The Intune one builds the Entra group ladder everything else addresses. |
-| `intune/` | Renders three manifest keys the client ignores into Intune: Store apps, Settings Catalog and OMA-URI profiles, scripts. |
+| `enrollment/` | The Cimian consumer, which publishes `computers.csv`. The shared enrollment code and the Intune group ladder live in [intune-gitops](https://github.com/windowsadmins/intune-gitops). |
+| `intune/` | The manifests, profiles and pipeline callers that render three keys the client ignores into Intune assignments, through the shared [intune-gitops](https://github.com/windowsadmins/intune-gitops) engine. |
 | `pkgsinfo/apps/managed/` | One YAML source-of-truth descriptor for each managed Store app. |
 | `.github/` | CI for this repo: the offline tests, a parse of every script and pipeline, terraform validate, and the workflow pin and permission lint. |
 
@@ -109,13 +109,37 @@ identifiers and assignment metadata live under `pkgsinfo/apps/managed/` rather
 than in the pipeline body. New release-controller logic stays inline in the
 pipeline YAML so the deployment remains self-contained.
 
-**Try it offline.** No tenant, no credentials, PyYAML the only dependency:
+**Try it offline.** No tenant, no credentials, PyYAML the only dependency.
+The engine and the group ladder live in
+[intune-gitops](https://github.com/windowsadmins/intune-gitops), so check it out
+beside this repo at the tag the pipelines pin:
+
+```
+git clone --branch v0.1.1 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+```
+
+Project the inventory:
 
 ```
 python3 inventory/projections/project.py inventory/inventory.csv --out-dir out/
-cd enrollment && python3 -m consumers.intune ../out/intune.csv --what-if
-cd ../intune && python3 -m stages.lint_conditions manifests/
-python3 -m stages.plan_assignments manifests/
+```
+
+Plan the group ladder, with this repo's enrollment directory first on the path:
+
+```
+PYTHONPATH="enrollment:../intune-gitops/enrollment" python3 -m consumers.intune out/intune.csv --what-if
+```
+
+Lint the manifest conditions:
+
+```
+python3 ../intune-gitops/engine/stages/lint_conditions.py --platform windows intune/manifests
+```
+
+Plan the assignments:
+
+```
+python3 ../intune-gitops/engine/stages/plan_assignments.py --platform windows intune/manifests
 ```
 
 With no `GRAPH_TOKEN` the Intune consumer prints the group plan and stops. Run
@@ -127,7 +151,7 @@ on a green build. So the input is validated before anything is written (row
 floors, resolution ratios, per-group and total shrink limits), a run that fails
 any check aborts whole rather than converging part of the estate, ownership
 markers keep the pipeline to its own objects, and `whatIf` is a supported way
-to run. See [`enrollment/README.md`](enrollment/README.md#guards).
+to run. See the [intune-gitops enrollment README](https://github.com/windowsadmins/intune-gitops/blob/v0.1.1/enrollment/README.md#guards).
 
 ## Cimian vs Munki
 
@@ -136,7 +160,7 @@ Same architecture, different platform specifics:
 - Packages are `.nupkg` / `.msi` / `.exe`, for `x64` and `arm64`, built with `cimipkg`. It ships with the Cimian tools and is developed at [cimian-pkg](https://github.com/windowsadmins/cimian-pkg).
 - Hooks are PowerShell (a small POSIX shim execs `pwsh` on the `.ps1`), so they run from Git Bash, WSL, or any `sh` Git ships on Windows.
 - `makecatalogs` emits a slightly different missing-installer warning; the hooks and the superseded resolver handle both dialects.
-- One condition genuinely differs. `machine_type == "laptop"` translates on macOS because Apple's marketing names carry the form factor, so it maps to a model-name prefix. Windows has no equivalent — "Surface Laptop" and "Surface Studio" share a prefix — so form factor comes from `deviceCategory`, and the linter says so rather than emitting a filter that would quietly match the wrong machines.
+- One condition genuinely differs. `machine_type == "laptop"` translates on macOS because Apple's marketing names carry the form factor, so it maps to a model-name prefix. Windows has no equivalent — "Surface Laptop" and "Surface Studio" share a prefix — so the linter refuses it rather than emitting a filter that would quietly match the wrong machines; target form factor with a group instead. Both translators live in [intune-gitops](https://github.com/windowsadmins/intune-gitops).
 
 The macOS half of the same pattern is [munki-gitops](https://github.com/rodchristiansen/munki-gitops).
 

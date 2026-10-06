@@ -23,16 +23,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Shared Intune engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: windowsadmins/intune-gitops
+          ref: 560f73ef7908bfc5c41efda60c8097bdce6075ce # v0.1.1
+          path: .intune-gitops
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - run: python -m pip install --quiet pyyaml
-      - name: Enrollment tests
-        working-directory: enrollment
-        run: python -m unittest discover -s tests -v
-      - name: Intune tests
-        working-directory: intune
-        run: python -m unittest discover -s tests -v
+      - name: Cimian enrollment consumer tests
+        env:
+          PYTHONPATH: enrollment:.intune-gitops/enrollment
+        run: python -m unittest discover -s enrollment/tests -v
       - name: Promotion tests
         run: python -m unittest discover -s promotion/tests -v
       - name: Quality tests
@@ -41,9 +46,12 @@ jobs:
         run: |
           python inventory/projections/project.py inventory/inventory.csv --out-dir "$RUNNER_TEMP/out"
           head -1 "$RUNNER_TEMP/out/cimian.csv" | tr -d '\r' | grep -qx 'serial,catalog,area,location,asset,usage,status,allocation,username,platform,fleet,hostname'
-      - name: Intune condition lint on the sample manifests
-        working-directory: intune
-        run: python -m stages.lint_conditions manifests/
+      - name: Intune lint and plan on the sample manifests
+        run: |
+          python .intune-gitops/engine/stages/lint_conditions.py --platform windows intune/manifests
+          python .intune-gitops/engine/stages/plan_assignments.py --platform windows intune/manifests
+      - name: Catalog declarations are cumulative
+        run: python intune/checks/catalog_waterfall.py
       - name: Workflow pins and permissions
         run: python .github/scripts/check_workflows.py
       - name: Every YAML file parses

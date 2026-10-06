@@ -2,12 +2,13 @@
 #
 # This is what actually runs, lifted nearly as-is and with tenant identifiers
 # replaced by placeholders. It is here for accuracy, not as the recommended
-# shape -- several thousand lines of PowerShell inline in YAML is why the test
-# suite in ../../tests/ tests extracted logic rather than this file.
+# shape -- several thousand lines of PowerShell inline in YAML is why the
+# engine moved into tested modules rather than testing this file.
 #
-# The readable version of the same logic is ../../stages/ and ../../lib/,
-# driven by ../azure/intune-mgmt.yml. Start there. Come here when you want to
-# see how it is really wired, or what a stage does that the sample omits.
+# The readable version of the same logic is the engine in
+# windowsadmins/intune-gitops, driven by ../azure/intune-mgmt.yml. Start there.
+# Come here when you want to see how it is really wired, or what a stage does
+# that the sample omits.
 #
 # Sanitized: service connection, variable group, storage account and container
 # names are placeholders; any Teams webhook reads from the variable group

@@ -61,7 +61,11 @@ function Sync([string] $Source, [string] $Dest, [bool] $Mirror) {
 }
 
 if ($PackagesOnly) {
-    Sync 'deployment/pkgs' 'deployment/pkgs' $false
+    # Create-only: an existing package is never replaced, whatever is on disk.
+    $src = Join-Path $RepoRoot 'deployment/pkgs'
+    if (-not (Test-Path $src)) { Write-Host 'No packages to upload'; return }
+    azcopy copy (Join-Path $src '*') "$base/deployment/pkgs`?$sas" --recursive --overwrite=false
+    if ($LASTEXITCODE -ne 0) { throw "azcopy copy of packages failed ($LASTEXITCODE)" }
     return
 }
 

@@ -141,24 +141,36 @@ jobs:
   - download: current
     artifact: autopkg-import
 
-  - pwsh: |
-      $ErrorActionPreference = 'Stop'
-      $repo = $env:BUILD_SOURCESDIRECTORY
-      $art = Join-Path $env:PIPELINE_WORKSPACE 'autopkg-import'
-      python -m pip install --quiet pyyaml
-      # The artifact came from a job that ran recipe code: check it again
-      # before it touches the checkout, and again once it has.
-      python promotion/check_import.py --artifact $art
-      if ($LASTEXITCODE -ne 0) { throw 'Artifact failed the checks' }
-      git fetch --quiet origin main --depth=1
-      git switch -C main origin/main
-      if (Test-Path (Join-Path $art 'deployment')) { Copy-Item -Path (Join-Path $art 'deployment') -Destination $repo -Recurse -Force }
-      python promotion/check_import.py --repo $repo
-      if ($LASTEXITCODE -ne 0) { throw 'Import output failed the checks' }
-      git add -A deployment/pkgsinfo
-      git diff --cached --quiet
-      Write-Host "##vso[task.setvariable variable=HAS_IMPORTS]$($LASTEXITCODE -ne 0)"
+  # The artifact came from a job that ran recipe code. Check it against main
+  # and against what storage already holds before it touches the checkout,
+  # and check the working tree again once it has. See check_import.py.
+  - task: AzureCLI@2
     displayName: Check and apply the import
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $ErrorActionPreference = 'Stop'
+        $repo = $env:BUILD_SOURCESDIRECTORY
+        $art = Join-Path $env:PIPELINE_WORKSPACE 'autopkg-import'
+        python -m pip install --quiet --require-hashes --only-binary=:all: -r promotion/requirements-autopkg.txt
+        git fetch --quiet origin main --depth=1
+        git switch -C main origin/main
+
+        $keys = Join-Path $env:AGENT_TEMPDIRECTORY 'existing-pkgs.txt'
+        az storage blob list --auth-mode login --account-name $env:STORAGE_ACCOUNT --container-name $env:STORAGE_CONTAINER `
+          --prefix 'deployment/pkgs/' --num-results '*' --query '[].name' -o tsv > $keys
+        if ($LASTEXITCODE -ne 0) { throw 'Could not list existing packages' }
+
+        python promotion/check_import.py --artifact $art --base $repo --existing-pkgs $keys
+        if ($LASTEXITCODE -ne 0) { throw 'Artifact failed the checks' }
+        if (Test-Path (Join-Path $art 'deployment')) { Copy-Item -Path (Join-Path $art 'deployment') -Destination $repo -Recurse -Force }
+        python promotion/check_import.py --repo $repo
+        if ($LASTEXITCODE -ne 0) { throw 'Import output failed the checks' }
+        git add -A deployment/pkgsinfo
+        git diff --cached --quiet
+        Write-Host "##vso[task.setvariable variable=HAS_IMPORTS]$($LASTEXITCODE -ne 0)"
 
   - task: AzureCLI@2
     displayName: Upload new packages

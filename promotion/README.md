@@ -63,6 +63,12 @@ it can write nothing.
 - **First stage only.** An import may only land in Development and Testing.
   Anything later is the promoter's job, and `check_import.py` fails an import
   that skips ahead.
+- **Add, never replace.** Every package in the artifact must be named by a
+  pkgsinfo in the same artifact whose `installer.hash` matches it, and must
+  not already exist in storage; the upload itself is create-only too. A
+  rewritten pkgsinfo is accepted only while main still has that item in the
+  first stage. Paths must be plain ASCII names, with no links, hidden
+  segments or case-only collisions with main.
 
 ## What moves on its own
 

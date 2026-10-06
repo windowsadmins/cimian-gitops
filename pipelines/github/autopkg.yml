@@ -137,16 +137,28 @@ jobs:
           name: autopkg-import
           path: ${{ runner.temp }}/import
 
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # The artifact came from a job that ran recipe code. Check it against
+      # main and against what storage already holds before it touches the
+      # checkout, and check the working tree again once it has.
       - name: Check and apply the import
         id: apply
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           python -m pip install --quiet --require-hashes --only-binary=:all: -r promotion/requirements-autopkg.txt
-          # The artifact came from a job that ran recipe code: check it before
-          # it touches the checkout, and again once it has.
+          $keys = Join-Path $env:RUNNER_TEMP 'existing-pkgs.txt'
+          az storage blob list --auth-mode login --account-name $env:STORAGE_ACCOUNT --container-name $env:STORAGE_CONTAINER `
+            --prefix 'deployment/pkgs/' --num-results '*' --query '[].name' -o tsv > $keys
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list existing packages' }
           $art = Join-Path $env:RUNNER_TEMP 'import'
-          python promotion/check_import.py --artifact $art
+          python promotion/check_import.py --artifact $art --base $env:GITHUB_WORKSPACE --existing-pkgs $keys
           if ($LASTEXITCODE -ne 0) { throw 'Artifact failed the checks' }
           if (Test-Path (Join-Path $art 'deployment')) { Copy-Item -Path (Join-Path $art 'deployment') -Destination $env:GITHUB_WORKSPACE -Recurse -Force }
           python promotion/check_import.py --repo $env:GITHUB_WORKSPACE
@@ -154,14 +166,6 @@ jobs:
           git add -A deployment/pkgsinfo
           git diff --cached --quiet
           "imports=$($LASTEXITCODE -ne 0)" | Out-File -Append $env:GITHUB_OUTPUT
-
-      - name: Azure login (OIDC)
-        if: steps.apply.outputs.imports == 'True'
-        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
-        with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Upload new packages
         if: steps.apply.outputs.imports == 'True'

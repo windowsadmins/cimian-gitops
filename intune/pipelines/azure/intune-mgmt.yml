@@ -32,7 +32,7 @@ resources:
       type: github
       endpoint: github-public
       name: windowsadmins/intune-gitops
-      ref: refs/tags/v0.1.1
+      ref: refs/tags/v0.1.2
 
 stages:
   - template: pipelines/azure/intune-mgmt.yml@intune_gitops

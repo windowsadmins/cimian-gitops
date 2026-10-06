@@ -1,0 +1,132 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  autopkg.yml — import new app versions with AutoPkg, every weekday morning.
+#
+#  1. Run the recipes in promotion/recipe_list.yaml with the Cimian-aware
+#     AutoPkg fork. New installers land in deployment/pkgs, new pkgsinfo in
+#     deployment/pkgsinfo, in the catalogs the recipe or its override sets.
+#  2. Stamp _metadata.created_by: autopkg on the new pkgsinfo, which is what
+#     makes promote-catalogs.yml move them on later.
+#  3. Upload the packages, add-only, so they are in storage before anything
+#     references them.
+#  4. Commit the pkgsinfo to main. push-to-production then rebuilds the
+#     catalogs, and its missing-package gate double-checks step 3.
+#
+#  Scripts read pipeline variables from the environment ($env:NAME), never as
+#  $(NAME) macros pasted into script text.
+# ──────────────────────────────────────────────────────────────────────────────
+
+trigger: none
+pr: none
+
+parameters:
+  - name: recipes
+    displayName: 'Recipe identifiers, comma-separated (blank runs the whole list)'
+    type: string
+    default: ' '
+
+schedules:
+  - cron: '0 14 * * 1-5'            # UTC; a few hours before the promotion run
+    displayName: Weekday AutoPkg run
+    branches: { include: [main] }
+    always: true
+
+pool:
+  vmImage: windows-latest
+
+variables:
+  - group: cimian-repo-secrets            # GitHubReadToken (public-repo read)
+  - name: azureServiceConnection          # workload identity federation
+    value: '<ado-service-connection>'
+  - name: STORAGE_ACCOUNT
+    value: 'examplecimianstorage'
+  - name: STORAGE_CONTAINER
+    value: 'repo'
+  # Keep in step with push-to-production: catalogs built with different
+  # makecatalogs rules than the ones that ship can disagree about duplicates.
+  - name: CIMIAN_TOOLS_TAG
+    value: '2026.09.18.1356'
+  - name: CIMIAN_TOOLS_SHA256
+    value: 'e6824a09095e4d1f86cff99469bb96f49b5b597fdbbab157139e97b933b73f71'
+  - name: TOOLS_DIR
+    value: '$(Agent.TempDirectory)/cimian-tools'
+
+jobs:
+- job: autopkg
+  timeoutInMinutes: 120
+  steps:
+  - checkout: self
+    clean: true
+    persistCredentials: true
+    fetchDepth: 1
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.12'
+
+  - pwsh: |
+      git config user.email 'pipeline@example.com'
+      git config user.name 'Cimian AutoPkg'
+      git fetch origin main --depth=1
+      git switch -C main origin/main
+      & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Install-CimianTools.ps1') `
+        -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination $env:TOOLS_DIR -Tools cimiimport.exe
+    displayName: Sync main and install cimiimport
+    env:
+      GITHUB_TOKEN: $(GitHubReadToken)
+
+  - pwsh: |
+      $recipes = @($env:RECIPES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      $params = @{
+        RepoRoot       = $env:BUILD_SOURCESDIRECTORY
+        CimiimportPath = Join-Path $env:TOOLS_DIR 'cimiimport.exe'
+        WorkDir        = Join-Path $env:AGENT_TEMPDIRECTORY 'autopkg'
+      }
+      if ($recipes) { $params.Recipes = $recipes }
+      & (Join-Path $env:BUILD_SOURCESDIRECTORY 'promotion/Invoke-AutoPkgRun.ps1') @params
+      if ($LASTEXITCODE -ne 0) {
+        # Keep going so the recipes that did import are published; the run
+        # still ends red (see the last step).
+        Write-Host "##vso[task.logissue type=warning]Some recipes failed"
+        Write-Host "##vso[task.setvariable variable=RECIPES_FAILED]true"
+      }
+    displayName: Run AutoPkg
+    env:
+      RECIPES: ${{ parameters.recipes }}
+      GITHUB_TOKEN: $(GitHubReadToken)
+
+  - pwsh: |
+      python promotion/stamp_metadata.py --repo $env:BUILD_SOURCESDIRECTORY
+      if ($LASTEXITCODE -ne 0) { throw 'stamp_metadata failed' }
+      git add -A deployment/pkgsinfo
+      git diff --cached --quiet
+      $changed = $LASTEXITCODE -ne 0
+      Write-Host "##vso[task.setvariable variable=HAS_IMPORTS]$changed"
+      Write-Host "New or changed pkgsinfo: $changed"
+    displayName: Stamp metadata
+
+  - task: AzureCLI@2
+    displayName: Upload new packages
+    condition: and(succeeded(), eq(variables['HAS_IMPORTS'], 'True'))
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Sync-RepoToBlob.ps1') `
+          -StorageAccount $env:STORAGE_ACCOUNT -Container $env:STORAGE_CONTAINER `
+          -RepoRoot $env:BUILD_SOURCESDIRECTORY -PackagesOnly
+
+  - pwsh: |
+      git commit -qm "AutoPkg imports $(Get-Date -AsUTC -Format yyyy-MM-dd)"
+      foreach ($try in 1..3) {
+        git pull --rebase -q origin main
+        if ($LASTEXITCODE -eq 0) { git push origin HEAD:main; if ($LASTEXITCODE -eq 0) { exit 0 } }
+        Start-Sleep -Seconds (10 * $try)
+      }
+      throw 'Could not push the import commit'
+    displayName: Commit imports
+    condition: and(succeeded(), eq(variables['HAS_IMPORTS'], 'True'))
+
+  - pwsh: throw 'One or more recipes failed; see the Run AutoPkg step.'
+    displayName: Fail if any recipe failed
+    condition: and(succeeded(), eq(variables['RECIPES_FAILED'], 'true'))

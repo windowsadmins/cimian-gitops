@@ -1,0 +1,22 @@
+# AutoPkg recipes the scheduled run imports. These are the upstream recipe
+# identifiers. To change what an import does, such as the catalogs it lands in
+# (Development and Testing is the usual start; promoter.py moves it on from
+# there), make an override with `autopkg make-override <identifier>`, keep it
+# in promotion/RecipeOverrides/, and list the override's identifier here.
+#
+# Recipes for Cimian: https://github.com/windowsadmins/autopkg-recipes
+#
+# Universal recipes (one installer for both architectures) have no suffix;
+# architecture-specific ones are named -x64 and -arm64.
+
+repos:
+  - https://github.com/windowsadmins/autopkg-recipes.git
+
+recipes:
+  - com.github.autopkg.cimian.Chrome
+  - com.github.autopkg.cimian.Firefox-x64
+  - com.github.autopkg.cimian.Firefox-arm64
+  - com.github.autopkg.cimian.7-Zip-x64
+  - com.github.autopkg.cimian.7-Zip-arm64
+  - com.github.autopkg.cimian.PowerShell-x64
+  - com.github.autopkg.cimian.PowerShell-arm64

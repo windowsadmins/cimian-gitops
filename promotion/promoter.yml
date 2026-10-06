@@ -1,0 +1,38 @@
+---
+# Catalog promotion rules for promoter.py.
+#
+# An item moves when its catalogs exactly match promote_from and it has sat
+# there for days_in_catalog days, counted from _metadata.cimian-promoter_edit_date
+# (or creation_date the first time). Catalogs are cumulative: an item in
+# Staging is also in Development and Testing, so every cohort still sees it.
+
+selection:
+  type: all
+  # Only pkgsinfo whose _metadata.created_by is listed here are promoted
+  # automatically. Hand-made and hand-imported items carry a different value
+  # and move only when someone commits a catalog change, so an internal
+  # package cannot ride the stages into Production unattended.
+  created_by:
+    - autopkg
+
+promotions:
+  testing to staging:
+    promote_from: [Development, Testing]
+    promote_to: [Development, Testing, Staging]
+    days_in_catalog: 2
+    # Per-item exceptions. A browser security fix should not wait a week, so
+    # these go from Testing straight to Production on the next run.
+    custom_items:
+      Chrome:
+        promote_to: [Development, Testing, Staging, Production]
+        days_in_catalog: 0
+      Firefox:
+        promote_to: [Development, Testing, Staging, Production]
+        days_in_catalog: 0
+
+  staging to production:
+    promote_from: [Development, Testing, Staging]
+    promote_to: [Development, Testing, Staging, Production]
+    days_in_catalog: 3
+
+default_days_in_catalog: 2

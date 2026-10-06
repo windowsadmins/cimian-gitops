@@ -1,0 +1,117 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  promote-catalogs.yml — move AutoPkg imports through the catalog stages.
+#
+#  Runs promotion/promoter.py twice each weekday: a morning preview that only
+#  reports what would move, and a promotion run a few hours later that edits
+#  the catalogs and commits to main. That commit is an ordinary deployment/**
+#  change, so push-to-production picks it up and publishes the new catalogs.
+#
+#  What moves, and how fast, is promotion/promoter.yml. Only pkgsinfo stamped
+#  _metadata.created_by: autopkg move on their own; everything else moves when
+#  a person commits a catalog change.
+#
+#  The build service identity needs Contribute on the repo, and permission to
+#  push to main past any branch policy (or point the push at a branch and open
+#  a pull request instead).
+# ──────────────────────────────────────────────────────────────────────────────
+
+trigger: none
+pr: none
+
+parameters:
+  - name: promotion
+    displayName: 'Promotion to run (a name from promoter.yml, or all)'
+    type: string
+    default: all
+  - name: preview
+    displayName: 'Preview only (dry run)'
+    type: boolean
+    default: false
+
+# Times are UTC. The preview runs early enough for someone to look at it and
+# pull an item before the promotion run.
+schedules:
+  - cron: '30 14 * * 1-5'
+    displayName: Weekday preview
+    branches: { include: [main] }
+    always: true
+  - cron: '0 18 * * 1-5'
+    displayName: Weekday promotion
+    branches: { include: [main] }
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+- job: promote
+  timeoutInMinutes: 30
+  steps:
+  - checkout: self
+    clean: true
+    persistCredentials: true
+    fetchDepth: 1
+
+  - bash: |
+      set -euo pipefail
+      if [[ "$PREVIEW_PARAM" == "True" ]]; then
+        mode=preview
+      elif [[ "$BUILD_REASON" != "Schedule" ]]; then
+        mode=promote
+      elif (( 10#$(date -u +%H) < 17 )); then
+        mode=preview
+      else
+        mode=promote
+      fi
+      if [[ ! "$PROMOTION" =~ ^[A-Za-z0-9\ _-]+$ ]]; then
+        echo "##vso[task.logissue type=error]promotion '$PROMOTION' has unexpected characters"; exit 1
+      fi
+      echo "Run mode: $mode"
+      echo "##vso[task.setvariable variable=RUN_MODE]$mode"
+    displayName: Decide preview or promote
+    env:
+      PREVIEW_PARAM: ${{ parameters.preview }}
+      PROMOTION: ${{ parameters.promotion }}
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.12'
+
+  - bash: python -m pip install --quiet pyyaml
+    displayName: Install PyYAML
+
+  - bash: |
+      set -euo pipefail
+      git config user.email "pipeline@example.com"
+      git config user.name "Cimian promoter"
+      git fetch origin main --depth=1
+      git switch -C main origin/main
+
+      args=(--pkgsinfo deployment/pkgsinfo/apps --yaml promotion/promoter.yml --markdown "$AGENT_TEMPDIRECTORY/promotions.md" --auto)
+      # --as-of 18 makes the preview judge eligibility at the promotion run's
+      # hour, so it lists what that run will actually move.
+      [[ "$RUN_MODE" == "preview" ]] && args+=(--dry-run --as-of 18)
+      [[ "$PROMOTION" != "all" ]] && args+=(-p "$PROMOTION")
+
+      python promotion/promoter.py "${args[@]}" 2>&1 | tee "$AGENT_TEMPDIRECTORY/promoter.log"
+      [[ -f "$AGENT_TEMPDIRECTORY/promotions.md" ]] && cat "$AGENT_TEMPDIRECTORY/promotions.md"
+    displayName: Run promoter
+    env:
+      PROMOTION: ${{ parameters.promotion }}
+
+  # The promoter also back-fills missing edit dates, so commit whenever the
+  # tree changed, but only in promote mode.
+  - bash: |
+      set -euo pipefail
+      git add -A deployment/pkgsinfo
+      if git diff --cached --quiet; then
+        echo "Nothing to commit."; exit 0
+      fi
+      git commit -qm "Catalog promotion $(date -u +%Y-%m-%d)"
+      for try in 1 2 3; do
+        git pull --rebase -q origin main && git push origin HEAD:main && exit 0
+        sleep $((try * 10))
+      done
+      echo "##vso[task.logissue type=error]Could not push the promotion commit"; exit 1
+    displayName: Commit promotions
+    condition: and(succeeded(), eq(variables['RUN_MODE'], 'promote'))

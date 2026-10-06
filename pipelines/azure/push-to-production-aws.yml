@@ -9,6 +9,9 @@
 #  role needs s3:ListBucket, s3:PutObject, s3:DeleteObject on the bucket and
 #  cloudfront:CreateInvalidation on the distribution. Every name below is a
 #  placeholder.
+#
+#  Scripts read pipeline variables from the environment ($env:NAME), never as
+#  $(NAME) macros pasted into script text.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # batch: a run never starts beside its predecessor from CI.
@@ -84,15 +87,15 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     - pwsh: |
-        & '$(Build.SourcesDirectory)/pipelines/scripts/Install-CimianTools.ps1' -Tag '$(CIMIAN_TOOLS_TAG)' -Sha256 '$(CIMIAN_TOOLS_SHA256)' -Destination '$(TOOLS_DIR)' -Tools makecatalogs.exe
+        & "$($env:BUILD_SOURCESDIRECTORY)/pipelines/scripts/Install-CimianTools.ps1" -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination $env:TOOLS_DIR -Tools makecatalogs.exe
       displayName: Install pinned makecatalogs
       env:
         GITHUB_TOKEN: $(GitHubReadToken)
 
     - pwsh: |
-        & '$(TOOLS_DIR)/makecatalogs.exe' --repo_path '$(REPO_PATH)'
+        & "$($env:TOOLS_DIR)/makecatalogs.exe" --repo_path $env:REPO_PATH
         if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
-        if (-not (Get-ChildItem '$(REPO_PATH)/catalogs' -Filter *.yaml -ErrorAction SilentlyContinue)) {
+        if (-not (Get-ChildItem "$($env:REPO_PATH)/catalogs" -Filter *.yaml -ErrorAction SilentlyContinue)) {
           throw 'makecatalogs wrote no catalogs'
         }
       displayName: Run makecatalogs
@@ -104,13 +107,13 @@ stages:
         regionName: $(AWS_REGION)
         scriptType: inline
         inlineScript: |
-          $inv = Join-Path '$(Agent.TempDirectory)' 'pkgs-inventory.txt'
-          aws s3api list-objects-v2 --bucket '$(S3_BUCKET)' --prefix 'deployment/pkgs/' `
+          $inv = Join-Path $env:AGENT_TEMPDIRECTORY 'pkgs-inventory.txt'
+          aws s3api list-objects-v2 --bucket $env:S3_BUCKET --prefix 'deployment/pkgs/' `
             --query 'Contents[].Key' --output text |
             ForEach-Object { $_ -split "`t" } | Where-Object { $_ -and $_ -ne 'None' } |
             Set-Content -LiteralPath $inv
           if ($LASTEXITCODE -ne 0) { throw 'Could not list deployment/pkgs in S3.' }
-          & '$(Build.SourcesDirectory)/pipelines/scripts/Test-PackagesPresent.ps1' -RepoPath '$(REPO_PATH)' -InventoryFile $inv
+          & "$($env:BUILD_SOURCESDIRECTORY)/pipelines/scripts/Test-PackagesPresent.ps1" -RepoPath $env:REPO_PATH -InventoryFile $inv
 
     # Metadata trees mirror git exactly (--delete); packages and source trees
     # are only ever added to.
@@ -125,15 +128,15 @@ stages:
           function Sync($src, $dest, [bool] $mirror) {
             if (-not (Test-Path $src)) { Write-Host "Skipping $src (not in this repo)"; return }
             $extra = if ($mirror) { @('--delete') } else { @() }
-            aws s3 sync $src "s3://$(S3_BUCKET)/$dest" @extra
+            aws s3 sync $src "s3://$($env:S3_BUCKET)/$dest" @extra
             if ($LASTEXITCODE -ne 0) { throw "aws s3 sync $src failed ($LASTEXITCODE)" }
           }
           foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') {
-            Sync "$(REPO_PATH)/$d" "deployment/$d" $true
+            Sync "$($env:REPO_PATH)/$d" "deployment/$d" $true
           }
-          Sync '$(REPO_PATH)/pkgs' 'deployment/pkgs' $false
-          Sync '$(Build.SourcesDirectory)/installers' 'installers' $false
-          Sync '$(Build.SourcesDirectory)/packages' 'packages' $false
+          Sync "$($env:REPO_PATH)/pkgs" 'deployment/pkgs' $false
+          Sync "$($env:BUILD_SOURCESDIRECTORY)/installers" 'installers' $false
+          Sync "$($env:BUILD_SOURCESDIRECTORY)/packages" 'packages' $false
 
     # Metadata only. Packages are version-named and never stale at the edge.
     - task: AWSPowerShellModuleScript@1
@@ -143,6 +146,6 @@ stages:
         regionName: $(AWS_REGION)
         scriptType: inline
         inlineScript: |
-          aws cloudfront create-invalidation --distribution-id '$(CLOUDFRONT_DISTRIBUTION_ID)' `
+          aws cloudfront create-invalidation --distribution-id $env:CLOUDFRONT_DISTRIBUTION_ID `
             --paths '/deployment/catalogs/*' '/deployment/manifests/*' '/deployment/pkgsinfo/*' '/deployment/icons/*'
           if ($LASTEXITCODE -ne 0) { throw "CloudFront invalidation failed ($LASTEXITCODE)" }

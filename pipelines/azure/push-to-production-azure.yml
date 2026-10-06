@@ -13,9 +13,12 @@
 #  the pkgs sync below picks them up.
 #
 #  Auth is the service connection's workload identity federation. There is no
-#  SAS token and no client secret; the identity needs Storage Blob Data
+#  stored SAS token and no client secret; the identity needs Storage Blob Data
 #  Contributor on the storage account and CDN Endpoint Contributor on the Front
 #  Door profile. Every name below is a placeholder.
+#
+#  Scripts read pipeline variables from the environment ($env:NAME), never as
+#  $(NAME) macros pasted into script text.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # batch: a run never starts beside its predecessor from CI. Two overlapping runs
@@ -102,18 +105,25 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     - pwsh: |
-        & '$(Build.SourcesDirectory)/pipelines/scripts/Install-CimianTools.ps1' -Tag '$(CIMIAN_TOOLS_TAG)' -Sha256 '$(CIMIAN_TOOLS_SHA256)' -Destination '$(TOOLS_DIR)' -Tools makecatalogs.exe
+        & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Install-CimianTools.ps1') `
+          -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination $env:TOOLS_DIR -Tools makecatalogs.exe
       displayName: Install pinned makecatalogs
       env:
         GITHUB_TOKEN: $(GitHubReadToken)
+        CIMIAN_TOOLS_TAG: $(CIMIAN_TOOLS_TAG)
+        CIMIAN_TOOLS_SHA256: $(CIMIAN_TOOLS_SHA256)
+        TOOLS_DIR: $(TOOLS_DIR)
 
     - pwsh: |
-        & '$(TOOLS_DIR)/makecatalogs.exe' --repo_path '$(REPO_PATH)'
+        & (Join-Path $env:TOOLS_DIR 'makecatalogs.exe') --repo_path $env:REPO_PATH
         if ($LASTEXITCODE -ne 0) { throw "makecatalogs failed ($LASTEXITCODE)" }
-        if (-not (Get-ChildItem '$(REPO_PATH)/catalogs' -Filter *.yaml -ErrorAction SilentlyContinue)) {
+        if (-not (Get-ChildItem (Join-Path $env:REPO_PATH 'catalogs') -Filter *.yaml -ErrorAction SilentlyContinue)) {
           throw 'makecatalogs wrote no catalogs'
         }
       displayName: Run makecatalogs
+      env:
+        TOOLS_DIR: $(TOOLS_DIR)
+        REPO_PATH: $(REPO_PATH)
 
     - task: AzureCLI@2
       displayName: 'Gate: every pkgsinfo location exists in blob'
@@ -122,40 +132,28 @@ stages:
         scriptType: pscore
         scriptLocation: inlineScript
         inlineScript: |
-          $inv = Join-Path '$(Agent.TempDirectory)' 'pkgs-inventory.txt'
+          $inv = Join-Path $env:AGENT_TEMPDIRECTORY 'pkgs-inventory.txt'
           az storage blob list --auth-mode login `
-            --account-name '$(STORAGE_ACCOUNT)' --container-name '$(STORAGE_CONTAINER)' `
+            --account-name $env:STORAGE_ACCOUNT --container-name $env:STORAGE_CONTAINER `
             --prefix 'deployment/pkgs/' --num-results '*' --query '[].name' -o tsv > $inv
           if ($LASTEXITCODE -ne 0) { throw 'Could not list deployment/pkgs; the identity needs Storage Blob Data Reader or better.' }
-          & '$(Build.SourcesDirectory)/pipelines/scripts/Test-PackagesPresent.ps1' -RepoPath '$(REPO_PATH)' -InventoryFile $inv
+          & "$($env:BUILD_SOURCESDIRECTORY)/pipelines/scripts/Test-PackagesPresent.ps1" -RepoPath $env:REPO_PATH -InventoryFile $inv
 
-    # azcopy picks up the service connection's login from the az CLI session.
-    # Metadata trees mirror git exactly (--delete-destination); packages and
-    # source trees are only ever added to, because a package another branch's
-    # pkgsinfo still uses must not vanish when main stops referencing it.
+    # Sync-RepoToBlob mints a short-lived user-delegation SAS from the service
+    # connection's login and runs azcopy with it. See the script for why azcopy
+    # is not left to fetch its own token on Windows agents.
     - task: AzureCLI@2
       displayName: Sync to Azure Blob
       env:
-        AZCOPY_AUTO_LOGIN_TYPE: AZCLI
+        STORAGE_ACCOUNT: $(STORAGE_ACCOUNT)
+        STORAGE_CONTAINER: $(STORAGE_CONTAINER)
       inputs:
         azureSubscription: $(azureServiceConnection)
         scriptType: pscore
         scriptLocation: inlineScript
         inlineScript: |
-          $ErrorActionPreference = 'Stop'
-          $base = 'https://$(STORAGE_ACCOUNT).blob.core.windows.net/$(STORAGE_CONTAINER)'
-          function Sync($src, $dest, [bool] $mirror) {
-            if (-not (Test-Path $src)) { Write-Host "Skipping $src (not in this repo)"; return }
-            $del = if ($mirror) { 'true' } else { 'false' }
-            azcopy sync $src "$base/$dest" --recursive --delete-destination=$del
-            if ($LASTEXITCODE -ne 0) { throw "azcopy sync $src failed ($LASTEXITCODE)" }
-          }
-          foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') {
-            Sync "$(REPO_PATH)/$d" "deployment/$d" $true
-          }
-          Sync '$(REPO_PATH)/pkgs' 'deployment/pkgs' $false
-          Sync '$(Build.SourcesDirectory)/installers' 'installers' $false
-          Sync '$(Build.SourcesDirectory)/packages' 'packages' $false
+          & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Sync-RepoToBlob.ps1') `
+            -StorageAccount $env:STORAGE_ACCOUNT -Container $env:STORAGE_CONTAINER -RepoRoot $env:BUILD_SOURCESDIRECTORY
 
     # Never purge /deployment/pkgs/*: packages are version-named, so a new build
     # is a new path and there is no stale copy at the edge. Purging them forces
@@ -168,9 +166,9 @@ stages:
         scriptLocation: inlineScript
         inlineScript: |
           az afd endpoint purge `
-            --resource-group '$(FD_RESOURCE_GROUP)' `
-            --profile-name '$(FD_PROFILE)' `
-            --endpoint-name '$(FD_ENDPOINT)' `
+            --resource-group $env:FD_RESOURCE_GROUP `
+            --profile-name $env:FD_PROFILE `
+            --endpoint-name $env:FD_ENDPOINT `
             --content-paths '/deployment/catalogs/*' '/deployment/manifests/*' '/deployment/pkgsinfo/*' '/deployment/icons/*' `
             --no-wait
           if ($LASTEXITCODE -ne 0) { throw "az afd endpoint purge failed ($LASTEXITCODE)" }

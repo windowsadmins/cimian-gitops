@@ -13,7 +13,7 @@ That split is what makes the whole fleet reproducible from Git:
 - A device enrols → Intune delivers **BootstrapMate** (one Win32 LOB) → BootstrapMate reads `management.json` and lays down the Cimian agent + its config → Cimian takes over and converges the machine against the repo.
 - New app, new version, new config? It's a commit and a pull request. The MDM is untouched.
 
-The pipeline that publishes that pipe is the centerpiece here: [`pipelines/azure/bootstrap-to-intune.yml`](pipelines/azure/bootstrap-to-intune.yml) (and its GitHub Actions / S3 twin at [`pipelines/github/bootstrap-to-intune.yml`](pipelines/github/bootstrap-to-intune.yml)). It builds and signs the BootstrapMate MSI, wraps it as an `.intunewin`, regenerates and uploads `management.json`, and pushes the Win32 LOB to Intune via Microsoft Graph with a single group assignment.
+The pipeline that publishes that pipe is the centerpiece here: [`pipelines/azure/bootstrap-to-intune.yml`](pipelines/azure/bootstrap-to-intune.yml) (and its GitHub Actions / S3 twin at [`pipelines/github/bootstrap-to-intune.yml`](pipelines/github/bootstrap-to-intune.yml)). It fetches and signs the BootstrapMate MSI from its GitHub release, wraps it as an `.intunewin`, publishes [`provisioning/public/management.json`](provisioning/public/management.json), and replaces the Win32 LOB in Intune via Microsoft Graph with a single group assignment, then repoints the Enrollment Status Page at the new app.
 
 ## From manual to GitOps
 
@@ -34,6 +34,7 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | `pipelines/azure/` | Azure DevOps pipelines: `push-to-production-*` (build catalogs + sync storage) and `bootstrap-to-intune.yml` (the centerpiece). |
 | `pipelines/github/` | The same pipelines as GitHub Actions workflows, authenticating with OpenID Connect. |
 | `pipelines/scripts/` | Helpers the pipelines share: a retrying GitHub Releases client, the pinned Cimian tools installer, and the missing-package gate. |
+| `provisioning/` | The BootstrapMate first-boot manifest the bootstrap pipeline publishes. |
 | `preflight/cimian/` | A cimipkg sample that installs a Cimian preflight script run before each check. |
 | `local-caching/` | Service Bus / SQS commit-listener packages that keep on-prem caching servers in sync. |
 | `inventory/` | The twelve-column device contract, a sample fleet, and the projection script that narrows it per system. |

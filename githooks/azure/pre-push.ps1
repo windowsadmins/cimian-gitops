@@ -1,17 +1,29 @@
 #Requires -Version 5.1
-# HOOK_VERSION = '2026.06.25'
+# HOOK_VERSION = '2026.10.06'
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push.ps1  –  safe Azure Blob upload for Cimian repo
 #
-#  • Gated to pushing main/master — other branches push freely, no sync.
+#  • Decided by the refs being pushed (stdin), not the checked-out branch. A
+#    push that lands on main/master from the primary checkout gets the full
+#    path below; anything else, including any push from a linked worktree,
+#    runs pre-push-pr-packages.ps1 to make sure the packages its pkgsinfo
+#    needs are in blob storage, and nothing more.
+#  • Skips entirely when the push touches nothing under deployment/ or an
+#    installers/ or packages/ payload.
 #  • Aborts when behind origin (unless fast-forward succeeds).
 #  • Re-runs makecatalogs as a final pre-flight (both warning dialects).
+#  • Checks categories in the pushed manifests when the repo carries
+#    quality/lint/Test-Categories.ps1.
+#  • Uploads are additive: deployment/pkgs is a partial on-demand cache on
+#    every machine, so a sync from it must never delete. The only delete path
+#    is the orphan cleanup, driven by committed pkgsinfo on every remote
+#    branch, with a floor and a cap. macOS sidecars (._*, .DS_Store) are never
+#    uploaded and are removed from blob storage on sight.
 #  • Every `azcopy sync` writes MD5 to blob metadata (--put-md5) so future
 #    --compare-hash=MD5 runs have something to compare against.
-#  • Azure orphan cleanup after successful sync (floor + cap, deployment-validated).
-#  • Junction guard refuses delete-syncs that would traverse into the primary
-#    worktree's cache.
+#  • --sync and --force also purge cimipkg build output that is already
+#    imported into deployment/pkgs.
 #
 #  • Env bypass: GIT_NO_VERIFY, SKIP_CIMIAN_HOOKS, SKIP_PRE_PUSH, DISABLE_CUSTOM_HOOKS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -22,7 +34,7 @@ $ErrorActionPreference = 'Stop'
 $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 . (Join-Path (Join-Path $HookDir '..') 'lib\common.ps1')
 
-Test-HookVersion -HookName 'pre-push' -HookVersion '2026.06.25'
+Test-HookVersion -HookName 'pre-push' -HookVersion '2026.10.06'
 if (Test-ShouldSkipHook -HookName 'pre-push') { exit 0 }
 Add-WorktreeCacheLink
 if (-not (Lock-Hook -HookName 'pre-push')) { exit 1 }
@@ -31,7 +43,7 @@ if (-not (Test-StagedBinarySize)) { exit 1 }
 # ── Configuration ────────────────────────────────────────────────────────────
 $RepoRoot = Get-CimianRepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $HookDir '..\..')).Path }
-$Deployment = Join-Path $RepoRoot 'deployment'
+$Deployment = Get-CimianDeploymentRoot -RepoRoot $RepoRoot
 $PkgsDir    = Join-Path $Deployment 'pkgs'
 
 $StorageAccount = if ($env:CIMIAN_STORAGE_ACCOUNT) { $env:CIMIAN_STORAGE_ACCOUNT } else { 'yourstorageaccount' }
@@ -97,6 +109,39 @@ function Complete-Log {
     Move-Item -Path $LogFile -Destination (Join-Path $LogDir "hook-pre-push-upload-$Today-$(Get-NextLogIndex).log") -Force -ErrorAction SilentlyContinue
 }
 
+# ── what is being pushed ─────────────────────────────────────────────────────
+$Manual = $ForceSync -or $DryRun -or $UploadSync -or ($TargetPaths.Count -gt 0)
+$RefLines = @()
+$PushedFiles = $null
+if (-not $Manual) {
+    $RefLines = @(Get-PushRefLine)
+    if ([Console]::IsInputRedirected -and $RefLines.Count -eq 0) {
+        Write-Log 'Nothing to push - skipping.'
+        Complete-Log
+        exit 0
+    }
+
+    # Branch pushes, and every push from a linked worktree, get the PR package
+    # check only. Without ref lines (run by hand) fall back to the branch.
+    $toMain = if ($RefLines.Count -gt 0) { Test-PushTargetsMain -RefLines $RefLines }
+              else { ([string](git symbolic-ref --quiet --short HEAD 2>$null)).Trim() -in @('main', 'master') }
+    if (-not $toMain -or (Test-IsLinkedWorktree)) {
+        Complete-Log
+        & (Join-Path $HookDir 'pre-push-pr-packages.ps1') -RefLines $RefLines
+        exit $LASTEXITCODE
+    }
+
+    if ($RefLines.Count -gt 0) {
+        $PushedFiles = Get-PushedChangedFile -RefLines $RefLines
+        $syncRelevant = '^(deployment/|installers/[^/]+/(payload/|build-info\.yaml)|packages/[^/]+/(payload/|build-info\.yaml))'
+        if ($null -ne $PushedFiles -and -not ($PushedFiles | Where-Object { $_ -match $syncRelevant })) {
+            Write-Log 'No deployment, installer or package changes in this push - skipping validation and sync.'
+            Complete-Log
+            exit 0
+        }
+    }
+}
+
 # ── Azure auth ───────────────────────────────────────────────────────────────
 function Invoke-AzureLogin {
     if ($TenantId) { az login --tenant $TenantId | Out-Null } else { az login | Out-Null }
@@ -138,6 +183,17 @@ function Remove-AzureOrphan {
     foreach ($loc in (Get-CanonicalPkgList)) { $canonical[$loc.ToLower()] = $loc }
     Write-Log "  $($canonical.Count) packages referenced in committed pkgsinfo"
 
+    # A payload is only an orphan if no branch needs it: an open pull request's
+    # package is already uploaded but not yet on main.
+    $branchSet = @{}
+    $remote = Add-RemotePkgsInfoLocation -CanonicalSet $branchSet -RepoRoot $RepoRoot
+    if (-not $remote.Available) {
+        Write-Log 'SKIP orphan cleanup: no remote branch refs, so it cannot tell which payloads other branches need. The push is unaffected.'
+        return
+    }
+    foreach ($loc in $branchSet.Keys) { $canonical[$loc.ToLower()] = $loc }
+    Write-Log "  $($canonical.Count) packages in use across $($remote.RemoteRefCount) remote branch(es)"
+
     if ($canonical.Count -lt $script:CIMIAN_MIN_PKGSINFO_FOR_VALID) {
         Write-Log "ABORT orphan cleanup: canonical set has only $($canonical.Count) pkgsinfo entries (min $script:CIMIAN_MIN_PKGSINFO_FOR_VALID)."
         return
@@ -151,16 +207,26 @@ function Remove-AzureOrphan {
     $listing = & $AzCopyExe list "$StorageUrl/deployment/pkgs/" 2>$null
     foreach ($line in $listing) {
         if ($line -match '^INFO:') { continue }
-        if ($line -match '^(.+?\.(nupkg|msi|exe|zip|intunewin|pkg));') {
-            $azureKeys += ($Matches[1].Trim() -replace '\\', '/')
+        if ($line -match '^(.+?);') {
+            $key = $Matches[1].Trim() -replace '\\', '/'
+            if ($key -match '\.(nupkg|msi|exe|zip|intunewin|pkg)$' -or (Test-IsSidecarName $key)) { $azureKeys += $key }
         }
     }
-    Write-Log "  $($azureKeys.Count) packages in Azure blob storage"
+    Write-Log "  $($azureKeys.Count) objects in Azure blob storage"
 
-    $orphans = @($azureKeys | Where-Object { -not $canonical.ContainsKey($_.ToLower()) } | Sort-Object -Unique)
+    # Sidecars are never payloads: remove them on sight, outside the cap.
+    $sidecars = @($azureKeys | Where-Object { Test-IsSidecarName $_ })
+    if ($sidecars.Count -gt 0) {
+        Write-Log "Removing $($sidecars.Count) macOS sidecar(s) (._*, .DS_Store) from blob storage"
+        if (-not $DryRun) {
+            foreach ($sc in $sidecars) { & $AzCopyExe remove "$StorageUrl/deployment/pkgs/$sc" --log-level=ERROR 2>&1 | Out-Null }
+        }
+    }
+
+    $orphans = @($azureKeys | Where-Object { -not (Test-IsSidecarName $_) -and -not $canonical.ContainsKey($_.ToLower()) } | Sort-Object -Unique)
 
     if ($orphans.Count -gt $AzureOrphanDeletionCap) {
-        Write-Log "ABORT orphan cleanup: $($orphans.Count) Azure orphans exceed cap ($AzureOrphanDeletionCap)."
+        Write-Log "SKIP orphan cleanup: $($orphans.Count) orphans exceed the review cap ($AzureOrphanDeletionCap). Nothing was deleted and the push is unaffected."
         $orphans | Select-Object -First 20 | ForEach-Object { Write-Log "    - $_" }
         if ($orphans.Count -gt 20) { Write-Log "    ... and $($orphans.Count - 20) more" }
         Write-Log '  Review manually or raise CIMIAN_AZURE_ORPHAN_DELETION_CAP if intentional.'
@@ -211,6 +277,15 @@ function Get-ChangedPaths {
     if ($ForceSync)  { return 'all' }
     if ($UploadSync) { return 'upload' }
 
+    if ($null -ne $PushedFiles) {
+        $parts = @()
+        if ($PushedFiles | Where-Object { $_ -match '^deployment/(pkgs|pkgsinfo)/' }) { $parts += 'pkgs' }
+        if ($PushedFiles | Where-Object { $_ -match '^deployment/icons/' })          { $parts += 'icons' }
+        if ($PushedFiles | Where-Object { $_ -match '^(installers|packages)/[^/]+/payload/' }) { $parts += 'payloads' }
+        if ($parts.Count -eq 0) { return 'none' }
+        return ($parts -join ' ')
+    }
+
     $branch = (git symbolic-ref --short HEAD 2>$null)
     if ($branch) { $branch = $branch.Trim() }
     $remoteRef = "origin/$branch"
@@ -228,6 +303,8 @@ function Get-ChangedPaths {
     $parts = @()
     if ($changedFiles -match '(?m)^deployment/(pkgs|pkgsinfo)/') { $parts += 'pkgs' }
     if ($changedFiles -match '(?m)^deployment/icons/')          { $parts += 'icons' }
+    $payloadChanges = git diff --name-only "$remoteRef..HEAD" -- installers/ packages/ 2>$null
+    if ($payloadChanges -match '(?m)^(installers|packages)/[^/]+/payload/') { $parts += 'payloads' }
     if ($parts.Count -eq 0) { return 'none' }
     return ($parts -join ' ')
 }
@@ -250,14 +327,10 @@ if ($TargetPaths.Count -gt 0) {
     exit 0
 }
 
-# ── branch gating ────────────────────────────────────────────────────────────
+# ── branch ───────────────────────────────────────────────────────────────────
+# Only main/master reach this point (see "what is being pushed" above).
 $currentBranch = (git symbolic-ref --quiet --short HEAD 2>$null)
-if ($currentBranch) { $currentBranch = $currentBranch.Trim() }
-if ($currentBranch -and $currentBranch -notin @('main', 'master')) {
-    Write-Log "Skipping upload — branch '$currentBranch' is not main/master."
-    Complete-Log
-    exit 0
-}
+if ($currentBranch) { $currentBranch = $currentBranch.Trim() } else { $currentBranch = 'main' }
 
 # ── fast-forward guard ───────────────────────────────────────────────────────
 git fetch --quiet origin $currentBranch 2>$null | Out-Null
@@ -344,6 +417,12 @@ if (-not $makecatalogs) {
     }
 }
 
+# ── category gate ────────────────────────────────────────────────────────────
+if (-not (Invoke-CategoryGate -RepoRoot $RepoRoot -ChangedFiles $PushedFiles)) {
+    Complete-Log
+    exit 1
+}
+
 # ── change detection → sync ──────────────────────────────────────────────────
 $changedPaths = Get-ChangedPaths
 if ($changedPaths -eq 'none') {
@@ -356,20 +435,20 @@ Test-AzureAuth
 $env:AZCOPY_AUTO_LOGIN_TYPE = 'AZCLI'
 Write-Log "On branch '$currentBranch' — syncing: $changedPaths"
 
-# SAFETY: refuse delete-sync when deployment/pkgs is a junction (linked
-# worktree). --delete-destination=true would traverse the link to enumerate
-# local files and delete Azure blobs not present in the sparse worktree view.
+# SAFETY: never sync from a junctioned deployment/pkgs (a linked worktree's
+# view of the primary's cache). Push from the primary worktree.
 if (Test-PathIsReparsePoint $PkgsDir) {
     Write-Log 'Aborting pre-push — deployment/pkgs is a junction (linked worktree). Push from the primary worktree.'
     Complete-Log
     exit 1
 }
 
-# --put-md5 is REQUIRED. Without it, future syncs can't compare hashes and
-# re-transfer every file every time.
+# Additive only: no --delete-destination. Nobody holds all of deployment/pkgs
+# locally, so deleting what a partial cache lacks would empty the bucket. The
+# orphan cleanup is the one delete path. --put-md5 is REQUIRED: without it,
+# future syncs cannot compare hashes and re-transfer every file every time.
 $syncFlags = @(
-    '--delete-destination=true'
-    '--exclude-pattern=*.DS_Store'
+    "--exclude-pattern=$script:SidecarExcludePattern"
     '--put-md5'
     '--compare-hash=MD5'
     '--log-level=ERROR'
@@ -377,23 +456,33 @@ $syncFlags = @(
 )
 if ($DryRun) { $syncFlags += '--dry-run' }
 
-if ($changedPaths -eq 'all' -or $changedPaths -match 'pkgs') {
-    Write-Log '>> syncing deployment/pkgs'
-    & $AzCopyExe sync $PkgsDir "$StorageUrl/deployment/pkgs/" @syncFlags 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
-    Remove-AzureOrphan
+function Sync-Up([string]$Local, [string]$Remote) {
+    if (-not (Test-Path -LiteralPath $Local)) { return }
+    Write-Log ">> syncing $Remote"
+    & $AzCopyExe sync $Local "$StorageUrl/$Remote" @syncFlags 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+    if ($LASTEXITCODE -ne 0) { Write-Log "ERROR: azcopy sync of $Remote failed ($LASTEXITCODE)"; Complete-Log; exit 1 }
 }
-if ($changedPaths -eq 'all' -or $changedPaths -match 'icons') {
-    Write-Log '>> syncing deployment/icons'
-    & $AzCopyExe sync (Join-Path $Deployment 'icons') "$StorageUrl/deployment/icons/" @syncFlags 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
-}
-if ($changedPaths -eq 'upload') {
-    Write-Log '>> upload mode — full hash-based sync'
-    foreach ($sub in @('pkgs', 'icons')) {
-        Write-Log ">> syncing deployment/$sub"
-        & $AzCopyExe sync (Join-Path $Deployment $sub) "$StorageUrl/deployment/$sub/" @syncFlags 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+
+# installers/<name>/payload and packages/<name>/payload are the source trees
+# cimipkg builds from. They go to blob storage so another admin, or a build
+# pipeline, can rebuild without the original download.
+function Sync-Payloads {
+    foreach ($top in 'installers', 'packages') {
+        $topDir = Join-Path $RepoRoot $top
+        if (-not (Test-Path -LiteralPath $topDir)) { continue }
+        foreach ($item in Get-ChildItem -LiteralPath $topDir -Directory -ErrorAction SilentlyContinue) {
+            $payload = Join-Path $item.FullName 'payload'
+            if (Test-Path -LiteralPath $payload) { Sync-Up $payload "$top/$($item.Name)/payload/" }
+        }
     }
-    Remove-AzureOrphan
 }
+
+$all = $changedPaths -in @('all', 'upload')
+if ($all -or $changedPaths -match 'pkgs')     { Sync-Up $PkgsDir 'deployment/pkgs/' }
+if ($all -or $changedPaths -match 'icons')    { Sync-Up (Join-Path $Deployment 'icons') 'deployment/icons/' }
+if ($all -or $changedPaths -match 'payloads') { Sync-Payloads }
+if ($all -or $changedPaths -match 'pkgs')     { Remove-AzureOrphan }
+if ($all) { Remove-ImportedBuildArtifact -RepoRoot $RepoRoot -PkgsDir $PkgsDir -DryRun:$DryRun }
 
 Write-Log 'pre-push complete'
 Complete-Log

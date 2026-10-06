@@ -13,14 +13,24 @@
 #    Test-CimianDeployment      – sanity-check a deployment dir before destructive ops
 #    Test-PathIsReparsePoint    – detect a junction/symlink (linked worktree cache)
 #    Lock-Hook / Unlock-Hook    – exclusive lock across worktrees
+#    Test-IsLinkedWorktree      – true inside a `git worktree add` checkout
+#    Test-SkipInLinkedWorktree  – the default "leave linked worktrees alone"
+#    Read-ConfigYamlRepoPath    – RepoPath from ManagedInstalls\Config.yaml
+#    Get-PushRefLine / Get-PushedChangedFile – what a push actually carries
+#    Test-PushTargetsMain       – does any pushed ref land on main/master
+#    Add-RemotePkgsInfoLocation – fold other branches' pkgsinfo into a keep-set
+#    Test-IsSidecarName         – ._* and .DS_Store, never payloads
+#    Remove-ImportedBuildArtifact – drop build/ copies already in deployment/pkgs
+#    Invoke-CategoryGate        – run quality/lint/Test-Categories.ps1 on a diff
 #
 #  Every .ps1 hook should start with a HOOK_VERSION comment and dot-source this:
 #
-#      # HOOK_VERSION = '2026.06.25'
+#      # HOOK_VERSION = '2026.10.06'
 #      $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 #      . (Join-Path $HookDir '..' 'lib' 'common.ps1')
-#      Test-HookVersion -HookName 'pre-commit' -HookVersion '2026.06.25'
+#      Test-HookVersion -HookName 'pre-commit' -HookVersion '2026.10.06'
 #      if (Test-ShouldSkipHook -HookName 'pre-commit') { exit 0 }
+#      if (Test-SkipInLinkedWorktree -HookName 'pre-commit') { exit 0 }
 #      Add-WorktreeCacheLink
 #      if (-not (Lock-Hook -HookName 'pre-commit')) { exit 1 }
 #      if (-not (Test-StagedBinarySize)) { exit 1 }
@@ -51,13 +61,45 @@ function Get-CimianRepoRoot {
     return ($root.Trim() -replace '/', '\')
 }
 
-# Resolve the deployment/ directory at the repo root. Cimian's repo layout is
+# RepoPath from Cimian's own client config. On an admin machine that also runs
+# the client, this is where the repo really lives, so it is the best second
+# opinion when the git checkout the hook runs in does not look like one.
+function Read-ConfigYamlRepoPath {
+    $configPath = if ($env:CIMIAN_CONFIG_YAML) { $env:CIMIAN_CONFIG_YAML } else { 'C:\ProgramData\ManagedInstalls\Config.yaml' }
+    if (-not (Test-Path -LiteralPath $configPath)) { return $null }
+    try {
+        foreach ($line in (Get-Content -LiteralPath $configPath -ErrorAction Stop)) {
+            if ($line -match '^\s*RepoPath\s*:\s*(.+?)\s*$') {
+                return $Matches[1].Trim().Trim('"', "'")
+            }
+        }
+    } catch { }
+    return $null
+}
+
+# Resolve the deployment/ directory. Cimian's repo layout is
 # deployment/{pkgs,pkgsinfo,catalogs,icons}.
+#
+# Every candidate is validated before it is trusted, because the destructive
+# steps (orphan prune) believe whatever this returns. A sparse scratch
+# workspace with one pkgsinfo once looked authoritative enough to call two
+# hundred blobs orphans. Precedence, first validated wins:
+#   1. <git repo root>\deployment
+#   2. RepoPath in ManagedInstalls\Config.yaml
+# With neither valid, the git path comes back unvalidated, and every
+# destructive caller re-checks Test-CimianDeployment before acting.
 function Get-CimianDeploymentRoot {
     param([string]$RepoRoot)
     if (-not $RepoRoot) { $RepoRoot = Get-CimianRepoRoot }
-    if (-not $RepoRoot) { return $null }
-    return (Join-Path $RepoRoot 'deployment')
+    $gitPath = if ($RepoRoot) { Join-Path $RepoRoot 'deployment' } else { $null }
+    if ($gitPath -and (Test-CimianDeployment -Path $gitPath)) { return $gitPath }
+
+    $configPath = Read-ConfigYamlRepoPath
+    if ($configPath -and (Test-CimianDeployment -Path $configPath)) {
+        if ($gitPath) { Write-Host "Using Config.yaml RepoPath $configPath ($gitPath does not validate as a Cimian deployment)" }
+        return $configPath
+    }
+    return $gitPath
 }
 
 # ── hook-version check ──────────────────────────────────────────────────────
@@ -361,4 +403,215 @@ function Unlock-Hook {
         Remove-Item $script:HookLockDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     $script:HookLockDir = $null
+}
+
+# ── linked worktrees ────────────────────────────────────────────────────────
+# A linked worktree (git worktree add) is for task work. The primary checkout
+# on main owns cache sync and full validation, and CI rebuilds the catalogs.
+# Running the heavy hooks in every worktree only blocks commits on caches the
+# worktree does not have. pre-push still runs there, in its PR-branch form.
+# Set CIMIAN_HOOKS_IN_WORKTREES=1 to run every hook anyway (caches are then
+# junctioned in from the primary by Add-WorktreeCacheLink).
+function Test-IsLinkedWorktree {
+    $gitDir = git rev-parse --path-format=absolute --git-dir 2>$null
+    $common = git rev-parse --path-format=absolute --git-common-dir 2>$null
+    if (-not $gitDir -or -not $common) { return $false }
+    return ($gitDir.Trim() -ne $common.Trim())
+}
+
+function Test-SkipInLinkedWorktree {
+    param([string]$HookName = 'hook')
+    if ($env:CIMIAN_HOOKS_IN_WORKTREES -eq '1') { return $false }
+    if (Test-IsLinkedWorktree) {
+        Write-Host "[$HookName] linked worktree - skipping (the primary checkout and CI cover this; CIMIAN_HOOKS_IN_WORKTREES=1 to run)"
+        return $true
+    }
+    return $false
+}
+
+# ── what a push carries ─────────────────────────────────────────────────────
+# git pipes one line per ref to pre-push on stdin:
+#   <local-ref> SP <local-sha> SP <remote-ref> SP <remote-sha>
+# The refs being pushed, not the branch that happens to be checked out, decide
+# what a push is. `git push origin feature:main` from a feature branch lands
+# on main; `git push origin feature` from main does not.
+$script:ZeroSha = '0000000000000000000000000000000000000000'
+
+function Get-PushRefLine {
+    if (-not [Console]::IsInputRedirected) { return @() }
+    try {
+        return @(([Console]::In.ReadToEnd() -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } catch { return @() }
+}
+
+function Test-PushTargetsMain {
+    param([string[]]$RefLines)
+    foreach ($line in $RefLines) {
+        $parts = $line -split '\s+'
+        if ($parts.Count -ge 4 -and $parts[1] -ne $script:ZeroSha -and $parts[2] -in @('refs/heads/main', 'refs/heads/master')) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# Files changed by the pushed commits, or $null when that cannot be worked out
+# (a caller then does the full check rather than skipping it). A new ref is
+# diffed from its merge-base with origin/main, so only the branch's own
+# commits count.
+function Get-PushedChangedFile {
+    param([string[]]$RefLines, [string]$PathSpec = '')
+    $files = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($line in $RefLines) {
+        $parts = $line -split '\s+'
+        if ($parts.Count -lt 4) { return $null }
+        $localSha = $parts[1]; $remoteSha = $parts[3]
+        if ($localSha -eq $script:ZeroSha) { continue }
+        if ($remoteSha -eq $script:ZeroSha) {
+            $mb = git merge-base $localSha origin/main 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $mb) { return $null }
+            $range = "$($mb.Trim())..$localSha"
+        } else {
+            $range = "$remoteSha..$localSha"
+        }
+        $gitArgs = @('diff', '--name-only', $range)
+        if ($PathSpec) { $gitArgs += @('--', $PathSpec) }
+        $changed = & git @gitArgs 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        foreach ($f in $changed) { if ($f) { [void]$files.Add($f.Trim()) } }
+    }
+    return ,@($files | Sort-Object)
+}
+
+# ── branch-aware orphan detection ───────────────────────────────────────────
+# A payload is orphaned only when no branch needs it. Packages are uploaded
+# when the branch that adds them is pushed, before it merges, so main alone is
+# not the whole package set: prune from main's view and an open pull request
+# loses its installer. This folds every origin branch tip's pkgsinfo
+# locations into the keep-set. With no remote refs it reports Available =
+# $false and the caller must skip the prune.
+function Add-RemotePkgsInfoLocation {
+    param(
+        [Parameter(Mandatory)] [hashtable]$CanonicalSet,
+        [Parameter(Mandatory)] [string]$RepoRoot
+    )
+    $remoteRefs = @(git -C $RepoRoot for-each-ref --format='%(refname)' refs/remotes/origin 2>$null |
+        Where-Object { $_ -and $_ -notmatch '/HEAD$' })
+    if ($LASTEXITCODE -ne 0 -or $remoteRefs.Count -eq 0) {
+        return [pscustomobject]@{ Available = $false; RemoteRefCount = 0; AddedCount = 0 }
+    }
+
+    $lines = @(git -C $RepoRoot grep -h -E '^[[:space:]]*location:[[:space:]]' $remoteRefs -- 'deployment/pkgsinfo/' 2>$null)
+    $added = 0
+    foreach ($line in $lines) {
+        $value = ($line -split 'location:', 2)[-1].Trim().Trim("'").Trim('"')
+        if (-not $value) { continue }
+        $loc = $value.TrimStart('\', '/').Replace('\', '/')
+        if (-not $CanonicalSet.ContainsKey($loc)) { $CanonicalSet[$loc] = $true; $added++ }
+    }
+    return [pscustomobject]@{ Available = $true; RemoteRefCount = $remoteRefs.Count; AddedCount = $added }
+}
+
+# ── macOS sidecars ──────────────────────────────────────────────────────────
+# A Mac that touches a share or a synced folder leaves an AppleDouble (._Name)
+# beside each file and a .DS_Store per directory. Nothing references them, so
+# they read as orphans and inflate the prune count past its cap. Worse, if one
+# process treats them as payload and another as junk, the same directory
+# copies back and forth forever. They are excluded from every sync and removed
+# on sight, outside the orphan cap.
+$script:SidecarExcludePattern = '.DS_Store;._*'
+
+function Test-IsSidecarName {
+    param([string]$Path)
+    $leaf = [IO.Path]::GetFileName(($Path -replace '\\', '/'))
+    return ($leaf -eq '.DS_Store' -or $leaf.StartsWith('._'))
+}
+
+# ── imported build artifacts ────────────────────────────────────────────────
+# installers/<name>/build and packages/<name>/build hold what cimipkg built.
+# Once an artifact is imported into deployment/pkgs, the build copy duplicates
+# bytes already kept and synced, and nothing else removes it because build/ is
+# gitignored. On a busy admin machine that is easily a hundred gigabytes. Only
+# artifacts whose file name already exists under deployment/pkgs are removed;
+# an unimported build is left alone.
+function Remove-ImportedBuildArtifact {
+    param(
+        [Parameter(Mandatory)] [string]$RepoRoot,
+        [string]$PkgsDir = (Join-Path $RepoRoot 'deployment\pkgs'),
+        [switch]$DryRun
+    )
+    if (-not (Test-Path -LiteralPath $PkgsDir)) { Write-Host 'Build purge: deployment/pkgs not present, skipping'; return }
+    $imported = @{}
+    foreach ($f in Get-ChildItem -LiteralPath $PkgsDir -Recurse -File -ErrorAction SilentlyContinue) { $imported[$f.Name] = $true }
+    if ($imported.Count -eq 0) { Write-Host 'Build purge: no imported packages, skipping'; return }
+
+    $freed = 0L; $files = 0; $dirs = 0
+    foreach ($top in 'installers', 'packages') {
+        $topDir = Join-Path $RepoRoot $top
+        if (-not (Test-Path -LiteralPath $topDir)) { continue }
+        foreach ($item in Get-ChildItem -LiteralPath $topDir -Directory -ErrorAction SilentlyContinue) {
+            $buildDir = Join-Path $item.FullName 'build'
+            if (-not (Test-Path -LiteralPath $buildDir)) { continue }
+            foreach ($artifact in Get-ChildItem -LiteralPath $buildDir -Recurse -File -ErrorAction SilentlyContinue) {
+                if (-not $imported.ContainsKey($artifact.Name)) { continue }
+                if ($DryRun) { Write-Host "  [DRY RUN] would remove $($artifact.FullName)"; continue }
+                $size = $artifact.Length
+                Remove-Item -LiteralPath $artifact.FullName -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $artifact.FullName)) { $freed += $size; $files++ }
+            }
+            if ($DryRun) { continue }
+            if (-not (Get-ChildItem -LiteralPath $buildDir -Recurse -File -ErrorAction SilentlyContinue)) {
+                Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $buildDir)) { $dirs++ }
+            }
+        }
+    }
+    if ($files -gt 0) {
+        Write-Host ('Build purge: removed {0} imported artifact(s) and {1} empty build dir(s), freeing {2} GB' -f $files, $dirs, [math]::Round($freed / 1GB, 2))
+    } else {
+        Write-Host 'Build purge: nothing to remove'
+    }
+}
+
+# ── category gate ───────────────────────────────────────────────────────────
+# makecatalogs copies whatever category it finds into the catalogs, where it
+# becomes a user-visible grouping in the client and a cache folder name. A
+# typo there is a new category. When the repo carries
+# quality/lint/Test-Categories.ps1 this runs it against the manifests in the
+# push, and only those: judging the whole tree would block pushes over state
+# the person pushing never touched. It skips, never blocks, when it cannot
+# tell what changed or cannot run. Returns $false only for a real failure.
+function Invoke-CategoryGate {
+    param(
+        [Parameter(Mandatory)] [string]$RepoRoot,
+        [AllowNull()] [string[]]$ChangedFiles
+    )
+    $check = Join-Path (Join-Path (Join-Path $RepoRoot 'quality') 'lint') 'Test-Categories.ps1'
+    if (-not (Test-Path -LiteralPath $check)) { return $true }
+    if ($null -eq $ChangedFiles) { Write-Host 'Category gate: cannot tell what changed, skipping'; return $true }
+    $scope = @($ChangedFiles | Where-Object { $_ -like 'deployment/pkgsinfo/*' -or $_ -like 'packages/*/build-info.yaml' -or $_ -like 'installers/*/build-info.yaml' })
+    if ($scope.Count -eq 0) { return $true }
+
+    $ps = (Get-Command pwsh -ErrorAction SilentlyContinue)
+    if (-not $ps) { $ps = Get-Command powershell -ErrorAction SilentlyContinue }
+    if (-not $ps) { Write-Host 'Category gate: no PowerShell host found, skipping'; return $true }
+
+    Write-Host "Category gate: checking $($scope.Count) changed manifest(s)"
+    # A file, not an array argument: -File cannot bind an array, so a list
+    # would arrive as one string per argument and the check would fail on
+    # argument binding alone.
+    $scopeFile = [IO.Path]::GetTempFileName()
+    Set-Content -LiteralPath $scopeFile -Value $scope -Encoding UTF8
+    try {
+        $out = & $ps.Source -NoProfile -File $check -RepoRoot $RepoRoot -OnlyFile $scopeFile 2>&1
+        $rc = $LASTEXITCODE
+    } finally {
+        Remove-Item -LiteralPath $scopeFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($rc -ne 0) {
+        Write-Host (($out | Out-String).Trim())
+        Write-Host 'PUSH BLOCKED: a manifest in this push has a category outside the agreed list, or none.'
+        return $false
+    }
+    return $true
 }

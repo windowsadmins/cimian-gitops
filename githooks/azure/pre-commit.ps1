@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# HOOK_VERSION = '2026.06.25'
+# HOOK_VERSION = '2026.10.06'
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-commit.ps1  –  validates Cimian pkgsinfo before committing (Azure)
@@ -27,8 +27,9 @@ $ErrorActionPreference = 'Stop'
 $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 . (Join-Path (Join-Path $HookDir '..') 'lib\common.ps1')
 
-Test-HookVersion -HookName 'pre-commit' -HookVersion '2026.06.25'
+Test-HookVersion -HookName 'pre-commit' -HookVersion '2026.10.06'
 if (Test-ShouldSkipHook -HookName 'pre-commit') { exit 0 }
+if (Test-SkipInLinkedWorktree -HookName 'pre-commit') { exit 0 }
 Add-WorktreeCacheLink
 if (-not (Lock-Hook -HookName 'pre-commit')) { exit 1 }
 if (-not (Test-StagedBinarySize)) { exit 1 }
@@ -36,7 +37,7 @@ if (-not (Test-StagedBinarySize)) { exit 1 }
 # ── Configuration ────────────────────────────────────────────────────────────
 $RepoRoot = Get-CimianRepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $HookDir '..\..')).Path }
-$Deployment  = Join-Path $RepoRoot 'deployment'
+$Deployment  = Get-CimianDeploymentRoot -RepoRoot $RepoRoot
 $PkgsDir     = Join-Path $Deployment 'pkgs'
 $PkgsInfoDir = Join-Path $Deployment 'pkgsinfo'
 $LintScript  = Join-Path (Join-Path $HookDir '..') 'lib\pkgsinfo-lint.py'

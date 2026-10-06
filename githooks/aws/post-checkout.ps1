@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# HOOK_VERSION = '2026.06.25'
+# HOOK_VERSION = '2026.10.06'
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-checkout.ps1  –  per-admin fresh-clone setup (AWS)
@@ -28,8 +28,9 @@ $ErrorActionPreference = 'Stop'
 $HookDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 . (Join-Path (Join-Path $HookDir '..') 'lib\common.ps1')
 
-Test-HookVersion -HookName 'post-checkout' -HookVersion '2026.06.25'
+Test-HookVersion -HookName 'post-checkout' -HookVersion '2026.10.06'
 if (Test-ShouldSkipHook -HookName 'post-checkout') { exit 0 }
+if (Test-SkipInLinkedWorktree -HookName 'post-checkout') { exit 0 }
 Add-WorktreeCacheLink
 
 # Enforce rebase-based pull strategy — keeps history linear.

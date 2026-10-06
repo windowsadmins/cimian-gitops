@@ -35,16 +35,23 @@ on:
         type: string
         default: 'Management Bootstrap'
 
+# id-token: write is granted only to the job that logs in, and that job runs
+# in a protected environment. Create the environment with required reviewers
+# or a main-only deployment branch rule, and make the federated credential's
+# subject the environment (repo:<owner>/<repo>:environment:<name>), so a
+# workflow edited on another branch cannot mint a token.
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   build:
     name: Fetch + sign BootstrapMate, build .intunewin
     runs-on: windows-latest
+    # The signing PFX is an environment secret, so only jobs in this
+    # protected environment can read it.
+    environment: cimian-bootstrap
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     # Inputs reach scripts only through env: and are read as $env:X, never
     # pasted into script text with ${{ }}, so a crafted input cannot become
@@ -108,7 +115,7 @@ jobs:
         & $tool -c $msi.DirectoryName -s $msi.FullName -o $msi.DirectoryName -q
         if ($LASTEXITCODE -ne 0) { throw "IntuneWinAppUtil failed ($LASTEXITCODE)" }
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: bootstrapmate-intune
         path: ${{ runner.temp }}/intune
@@ -116,14 +123,18 @@ jobs:
   publish-manifest:
     name: Upload management.json to S3 + invalidate CloudFront
     runs-on: windows-latest
+    environment: cimian-bootstrap
+    permissions:
+      contents: read
+      id-token: write
     env:
       S3_BUCKET: ${{ vars.S3_BUCKET }}
       CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
       MANAGEMENT_JSON_URL: ${{ vars.MANAGEMENT_JSON_URL }}   # e.g. https://cimian.example.com/bootstrap/management.json
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-    - uses: aws-actions/configure-aws-credentials@v4
+    - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
       with:
         role-to-assume: ${{ vars.AWS_ROLE_ARN }}
         aws-region: ${{ vars.AWS_REGION }}
@@ -156,16 +167,20 @@ jobs:
     name: Win32 LOB to Intune + assign + ESP
     runs-on: windows-latest
     needs: build
+    environment: cimian-bootstrap
+    permissions:
+      contents: read
+      id-token: write
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: bootstrapmate-intune
         path: ${{ runner.temp }}/intune
 
     - name: Azure login (OIDC)
-      uses: azure/login@v2
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
       with:
         client-id: ${{ vars.AZURE_CLIENT_ID }}
         tenant-id: ${{ vars.AZURE_TENANT_ID }}

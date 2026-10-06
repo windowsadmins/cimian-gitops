@@ -4,8 +4,8 @@
 # .github/workflows/ in your Cimian repo.
 #
 # Auth is OpenID Connect: configure-aws-credentials assumes an IAM role whose
-# trust policy accepts token.actions.githubusercontent.com for this repo's main
-# branch. No access keys are stored. The role needs s3:ListBucket,
+# trust policy accepts token.actions.githubusercontent.com with the subject
+# repo:<owner>/<repo>:environment:cimian-production. No access keys are stored. The role needs s3:ListBucket,
 # s3:PutObject and s3:DeleteObject on the bucket and
 # cloudfront:CreateInvalidation on the distribution.
 
@@ -22,8 +22,12 @@ concurrency:
   group: cimian-push-production
   cancel-in-progress: false
 
+# id-token: write is granted only to the job that logs in, and that job runs
+# in a protected environment. Create the environment with required reviewers
+# or a main-only deployment branch rule, and make the federated credential's
+# subject the environment (repo:<owner>/<repo>:environment:<name>), so a
+# workflow edited on another branch cannot mint a token.
 permissions:
-  id-token: write
   contents: read
 
 env:
@@ -37,8 +41,12 @@ env:
 jobs:
   deploy:
     runs-on: windows-latest
+    environment: cimian-production
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pinned makecatalogs
         shell: pwsh
@@ -56,7 +64,7 @@ jobs:
           }
 
       - name: AWS login (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}

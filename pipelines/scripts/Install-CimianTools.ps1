@@ -18,9 +18,10 @@ pipeline that calls this. GitHub shows the digest for each asset:
 
     gh api repos/windowsadmins/cimian/releases/tags/<tag> --jq '.assets[] | [.name, .digest] | @tsv'
 
--ExpectedSigner adds an Authenticode check on each extracted tool (Windows
-only). Use it when the tools you install are signed, for example a build you
-re-sign and host yourself.
+-ExpectedSignerThumbprint adds an Authenticode check on each extracted tool
+(Windows only): the signature must be valid and the signing certificate's
+thumbprint must equal the one given. Use it when the tools you install are
+signed, for example a build you re-sign and host yourself.
 
 .EXAMPLE
 ./pipelines/scripts/Install-CimianTools.ps1 -Tag 2026.09.18.1356 -Sha256 e6824a09095e4d1f86cff99469bb96f49b5b597fdbbab157139e97b933b73f71 -Destination $env:RUNNER_TEMP/cimian -Tools makecatalogs.exe
@@ -29,7 +30,7 @@ param(
     [Parameter(Mandatory)] [string] $Tag,
     [Parameter(Mandatory)] [ValidatePattern('^[0-9a-fA-F]{64}$')] [string] $Sha256,
     [Parameter(Mandatory)] [string] $Destination,
-    [string] $ExpectedSigner,
+    [ValidatePattern('^[0-9a-fA-F]{40}$')] [string] $ExpectedSignerThumbprint,
     [string[]] $Tools = @('makecatalogs.exe'),
     [ValidateSet('x64', 'arm64')] [string] $Architecture = 'x64'
 )
@@ -64,11 +65,14 @@ try {
     foreach ($tool in $Tools) {
         $hit = Get-ChildItem -Path $extract -Filter $tool -File -Recurse | Select-Object -First 1
         if (-not $hit) { throw "$tool not found in $($got.Name)" }
-        if ($ExpectedSigner) {
+        if ($ExpectedSignerThumbprint) {
             $sig = Get-AuthenticodeSignature -LiteralPath $hit.FullName
             if ($sig.Status -ne 'Valid') { throw "$tool signature is $($sig.Status), not Valid" }
-            if ($sig.SignerCertificate.Subject -notlike "*$ExpectedSigner*") {
-                throw "$tool is signed by '$($sig.SignerCertificate.Subject)', expected '$ExpectedSigner'"
+            # Exact thumbprint, not a subject match: any valid certificate can
+            # carry a subject that contains a given string.
+            $thumb = [string] $sig.SignerCertificate.Thumbprint
+            if (-not [string]::Equals($thumb, $ExpectedSignerThumbprint, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "$tool is signed by certificate $thumb ($($sig.SignerCertificate.Subject)), expected $ExpectedSignerThumbprint"
             }
         }
         Copy-Item -LiteralPath $hit.FullName -Destination (Join-Path $Destination $tool) -Force

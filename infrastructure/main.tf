@@ -117,9 +117,15 @@ resource "azurerm_role_assignment" "admin_blob" {
 # ─── Client authentication ────────────────────────────────────────────────────
 #
 # Clients send a shared token in an X-Cimian-Token header (Cimian's
-# AdditionalHttpHeaders setting). When it matches, Front Door strips the header
-# and appends a read-only SAS before the request reaches the private container.
-# A request without the token reaches the container with no SAS and gets a 403.
+# AdditionalHttpHeaders setting). Two layers act on it:
+#
+#   1. A WAF custom rule blocks any /deployment/ request whose header is
+#      missing or wrong, with a 403. The WAF runs before the cache lookup, so
+#      an unauthenticated request never reaches the cache and can never be
+#      served an object an authorised client caused to be cached. The cache key
+#      is the URL alone, which is why rejection has to happen first.
+#   2. For requests that pass, a rule-set rule strips the header and appends a
+#      read-only SAS, so the private container serves them.
 #
 # The token is generated here and kept in Key Vault, so the preferences package
 # that sets AdditionalHttpHeaders reads it from the vault at build time.
@@ -249,11 +255,10 @@ resource "azurerm_cdn_frontdoor_rule" "pkg_immutable" {
   }
 
   actions {
-    # UseQueryString, as on the route: see the cache note there.
     route_configuration_override_action {
       cache_behavior                = "OverrideAlways"
       cache_duration                = "365.00:00:00"
-      query_string_caching_behavior = "UseQueryString"
+      query_string_caching_behavior = "IgnoreQueryString"
     }
   }
 
@@ -307,12 +312,10 @@ resource "azurerm_cdn_frontdoor_route" "repo" {
   link_to_default_domain          = true
 
   cache {
-    # Keep the query string in the cache key. Authenticated requests carry the
-    # appended SAS, so their cache entries never match a request that arrived
-    # without the token; with IgnoreQueryString an unauthenticated request
-    # could be served an object an authenticated one had cached. Check it after
-    # the first deploy: request a cached package with no token and expect 403.
-    query_string_caching_behavior = "UseQueryString"
+    # Cached objects are shared between clients. That is safe only because the
+    # WAF policy below rejects a request without a valid token before the cache
+    # is consulted; see "Client authentication" above.
+    query_string_caching_behavior = "IgnoreQueryString"
     compression_enabled           = true
     content_types_to_compress     = ["application/json", "application/xml", "text/plain", "text/csv"]
   }
@@ -345,4 +348,70 @@ resource "azurerm_cdn_frontdoor_custom_domain_association" "cimian" {
     azurerm_cdn_frontdoor_route.repo.id,
     azurerm_cdn_frontdoor_route.bootstrap.id,
   ]
+}
+
+# ─── WAF: reject unauthenticated requests before the cache ───────────────────
+#
+# Custom rules are available on the Standard tier. The rule matches when the
+# path is under /deployment/ AND the token header is not exactly the expected
+# value (a missing header also fails the Equal test), and blocks with a 403.
+# /bootstrap/* is outside the match and stays public.
+
+resource "azurerm_cdn_frontdoor_firewall_policy" "cimian" {
+  name                              = "cimianwaf"
+  resource_group_name               = azurerm_resource_group.cimian.name
+  sku_name                          = azurerm_cdn_frontdoor_profile.cimian.sku_name
+  enabled                           = true
+  mode                              = "Prevention"
+  custom_block_response_status_code = 403
+  tags                              = var.tags
+
+  custom_rule {
+    name     = "RequireClientToken"
+    enabled  = true
+    priority = 1
+    type     = "MatchRule"
+    action   = "Block"
+
+    match_condition {
+      match_variable = "RequestUri"
+      operator       = "Contains"
+      match_values   = ["/deployment/"]
+      transforms     = ["Lowercase"]
+    }
+
+    match_condition {
+      match_variable     = "RequestHeader"
+      selector           = "X-Cimian-Token"
+      operator           = "Equal"
+      negation_condition = true
+      match_values       = [random_password.client_token.result]
+    }
+  }
+}
+
+resource "azurerm_cdn_frontdoor_security_policy" "cimian" {
+  name                     = "cimian-waf"
+  cdn_frontdoor_profile_id = azurerm_cdn_frontdoor_profile.cimian.id
+
+  security_policies {
+    firewall {
+      cdn_frontdoor_firewall_policy_id = azurerm_cdn_frontdoor_firewall_policy.cimian.id
+
+      association {
+        patterns_to_match = ["/*"]
+
+        domain {
+          cdn_frontdoor_domain_id = azurerm_cdn_frontdoor_endpoint.cimian.id
+        }
+
+        dynamic "domain" {
+          for_each = azurerm_cdn_frontdoor_custom_domain.cimian
+          content {
+            cdn_frontdoor_domain_id = domain.value.id
+          }
+        }
+      }
+    }
+  }
 }

@@ -13,26 +13,56 @@ pull request and apply it from `main` behind an approval.
 | `public` container (anonymous blob read, no listing) | Files BootstrapMate fetches at the ESP, under `bootstrap/`, before the machine has a credential.                                  |
 | Key Vault, RBAC authorization                        | No access policies. Holds the client token and anything else the pipelines read, such as the signing certificate.                 |
 | Front Door Standard profile and endpoint             | `/deployment/*` to the `repo` container, `/bootstrap/*` to `public/bootstrap`. Optional custom domain with a managed certificate. |
-| Front Door rule set                                  | Packages cached for a year; the client token check that admits a request to the private container.                                |
+| Front Door rule set | Packages cached for a year; swaps the client token for a read-only SAS. |
+| WAF policy (Standard, custom rule) | Rejects `/deployment/` requests without the client token with a 403, before the cache. |
 | Role assignments                                     | The pipeline identity gets Storage Blob Data Contributor, Key Vault Secrets User and CDN Endpoint Contributor.                    |
 
 ## How clients authenticate
 
 Cimian clients send a shared token in an `X-Cimian-Token` header, set through
-the `AdditionalHttpHeaders` key in `Config.yaml`. When the header matches,
-Front Door drops it and appends a read-only SAS before forwarding to the
-private container. A request without it reaches the container with no SAS and
-gets a 403.
+the `AdditionalHttpHeaders` key in `Config.yaml`. Two layers act on it.
+
+1. **A WAF custom rule rejects bad requests before the cache.** Any request
+   under `/deployment/` without the exact token gets a 403 from Front Door's
+   WAF. The WAF runs before the cache lookup, and that ordering is the point.
+   Front Door keys its cache on the URL alone, so an auth check placed after
+   the cache could let an unauthenticated request receive an object an
+   authorised client had pulled into the cache. `/bootstrap/*` sits outside
+   the rule and stays public.
+2. **A rule-set rule turns the token into storage access.** For requests that
+   pass, Front Door drops the header and appends a read-only SAS before
+   forwarding to the private container.
 
 Terraform generates the token and stores it in Key Vault as
 `cimian-client-token`, so the package that writes client preferences reads it
-from there at build time. The SAS is reissued every `sas_rotation_days` and is
-valid for twice that, so the infra pipeline must run at least that often. A
-schedule on the pipeline does it.
+from there at build time. The token is also visible in the WAF policy to anyone
+with read access on the resource group, so keep that role assignment narrow.
 
-The token and the SAS both end up in Terraform state. Keep state in its own
-storage account, readable only by the pipeline identity and the people who
-administer it.
+The SAS is reissued every `sas_rotation_days` and is valid for twice that, so
+the infra pipeline must run at least that often. The monthly schedule on both
+pipelines does it.
+
+## Secrets and the pipelines
+
+The token and the SAS live in Terraform state, and a saved plan file holds
+them in plain text too. So:
+
+- **Plans are never uploaded as artifacts.** Artifacts on a public repo can be
+  downloaded by anyone signed in. The apply job plans and applies in one job,
+  inside the protected environment.
+- **Pull requests get no cloud credential.** They run `terraform fmt`,
+  `terraform init -backend=false` and `terraform validate` only. A pull request
+  can change the workflow it runs, so any credential it could reach is one it
+  could leak.
+- **In GitHub,** only the `environment:cimian-infrastructure` federated
+  subject may hold state or Key Vault access. Never add a federated credential
+  for `pull_request` that can read state or the vault.
+- **In Azure DevOps,** add a Branch control check on the service connection
+  allowing only `refs/heads/main`. A pull request build then cannot use the
+  connection, even if it edits the YAML to ask for it.
+- **No output carries a secret.** Values derived from the token and the SAS
+  are marked sensitive by their providers, so plan output prints
+  `(sensitive value)` instead of them.
 
 ## Before the first apply
 

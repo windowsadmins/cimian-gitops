@@ -1,0 +1,13 @@
+Identifier: local.cimian.Firefox-arm64
+Input:
+  ARCHITECTURE: arm64
+  DOWNLOAD_URL: https://download.mozilla.org/?product=firefox-latest-ssl&os=win64-aarch64&lang=en-US
+  NAME: Firefox
+ParentRecipe: com.github.autopkg.cimian.Firefox-arm64
+ParentRecipeTrustInfo:
+  non_core_processors: {}
+  parent_recipes:
+    com.github.autopkg.cimian.Firefox-arm64:
+      git_hash: 4c51218afd3bd314a357031bc657a9ce17f18474
+      path: ~/RecipeRepos/com.github.windowsadmins.autopkg-recipes/Firefox/Firefox-arm64.cimian.recipe.yaml
+      sha256_hash: c72e5925ef6cfd1b4e5eb9b5ba41536fc0c980b0c243c71f189d313196fd91f4

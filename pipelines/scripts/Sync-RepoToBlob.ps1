@@ -27,10 +27,22 @@ param(
     # packages and commits their pkgsinfo: the packages must be in storage
     # before the commit that references them, and the metadata trees are
     # published later by push-to-production from the committed state.
-    [switch] $PackagesOnly
+    [switch] $PackagesOnly,
+    [string] $DefaultBranch = 'main'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Catalogs, manifests and pkgsinfo are what clients act on, so they are only
+# ever published from the default branch: a run queued by hand on another
+# branch must not be able to put unreviewed or unpromoted metadata in front
+# of the fleet. -PackagesOnly uploads deployment/pkgs and nothing else, from
+# any branch, since a package nothing references is inert. An unknown ref
+# fails closed.
+$ref = if ($env:GITHUB_REF) { $env:GITHUB_REF } elseif ($env:BUILD_SOURCEBRANCH) { $env:BUILD_SOURCEBRANCH } else { '' }
+if (-not $PackagesOnly -and $ref -ne "refs/heads/$DefaultBranch") {
+    throw "Refusing to publish repo metadata from '$ref'; only refs/heads/$DefaultBranch may. Use -PackagesOnly to upload packages alone."
+}
 
 $expiry = (Get-Date).ToUniversalTime().AddHours(2).ToString("yyyy-MM-ddTHH:mm'Z'")
 $sas = az storage container generate-sas --account-name $StorageAccount --name $Container `

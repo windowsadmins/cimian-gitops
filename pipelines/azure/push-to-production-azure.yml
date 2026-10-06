@@ -51,6 +51,9 @@ variables:
   # new makecatalogs only reaches production through a reviewed edit.
   - name: CIMIAN_TOOLS_TAG
     value: '2026.09.18.1356'
+  # SHA-256 of that release's CimianTools-x64 nupkg. Change it with the tag.
+  - name: CIMIAN_TOOLS_SHA256
+    value: 'e6824a09095e4d1f86cff99469bb96f49b5b597fdbbab157139e97b933b73f71'
   - name: TOOLS_DIR
     value: '$(Agent.TempDirectory)/cimian-tools'
   - name: REPO_PATH
@@ -99,7 +102,7 @@ stages:
         SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
     - pwsh: |
-        & '$(Build.SourcesDirectory)/pipelines/scripts/Install-CimianTools.ps1' -Tag '$(CIMIAN_TOOLS_TAG)' -Destination '$(TOOLS_DIR)' -Tools makecatalogs.exe
+        & '$(Build.SourcesDirectory)/pipelines/scripts/Install-CimianTools.ps1' -Tag '$(CIMIAN_TOOLS_TAG)' -Sha256 '$(CIMIAN_TOOLS_SHA256)' -Destination '$(TOOLS_DIR)' -Tools makecatalogs.exe
       displayName: Install pinned makecatalogs
       env:
         GITHUB_TOKEN: $(GitHubReadToken)

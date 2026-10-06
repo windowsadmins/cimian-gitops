@@ -31,6 +31,8 @@ env:
   S3_BUCKET: ${{ vars.S3_BUCKET }}
   CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
   CIMIAN_TOOLS_TAG: '2026.09.18.1356'
+  # SHA-256 of that release's CimianTools-x64 nupkg. Change it with the tag.
+  CIMIAN_TOOLS_SHA256: 'e6824a09095e4d1f86cff99469bb96f49b5b597fdbbab157139e97b933b73f71'
 
 jobs:
   deploy:
@@ -42,7 +44,7 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: ./pipelines/scripts/Install-CimianTools.ps1 -Tag $env:CIMIAN_TOOLS_TAG -Destination "$env:RUNNER_TEMP/cimian-tools" -Tools makecatalogs.exe
+        run: ./pipelines/scripts/Install-CimianTools.ps1 -Tag $env:CIMIAN_TOOLS_TAG -Sha256 $env:CIMIAN_TOOLS_SHA256 -Destination "$env:RUNNER_TEMP/cimian-tools" -Tools makecatalogs.exe
 
       - name: Run makecatalogs
         shell: pwsh

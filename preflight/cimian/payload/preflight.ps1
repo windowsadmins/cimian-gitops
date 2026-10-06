@@ -1,9 +1,11 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  preflight.ps1 — runs before every managedsoftwareupdate check.
 #
-#  Cimian executes this file (when present at C:\Program Files\Cimian\preflight.ps1)
-#  immediately before each "check" run, the same way Munki runs its preflight on
-#  macOS. Keep it FAST and IDEMPOTENT — it runs on every cycle.
+#  Cimian executes this file immediately before each "check" run, the same way
+#  Munki runs its preflight on macOS. It looks in two places and runs the first
+#  it finds: C:\Program Files\Cimian\preflight.ps1 (where this package puts it),
+#  then C:\ProgramData\ManagedInstalls\sbin\preflight.ps1. Keep it FAST and
+#  IDEMPOTENT — it runs on every cycle.
 #
 #  THIS IS A TEMPLATE. The body below is representative and harmless: it writes a
 #  run marker to the Cimian log and (optionally) removes a conflicting Chocolatey
@@ -17,7 +19,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-$LogDir  = 'C:\ProgramData\ManagedInstalls\Logs'
+$LogDir  = 'C:\ProgramData\ManagedInstalls\logs'
 $LogFile = Join-Path $LogDir 'preflight.log'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
@@ -42,6 +44,8 @@ if ($env:ChocolateyInstall -and (Test-Path $chocoShim)) {
 
 Write-Log 'Preflight: complete.'
 
-# Cimian ignores the preflight exit code for the check flow, but exit cleanly so
-# nothing downstream interprets a stray non-zero as a failure.
+# A non-zero exit is a preflight failure, and what Cimian does next is set by
+# PreflightFailureAction in Config.yaml: 'continue' (the default) logs it and
+# carries on, 'warn' carries on with a warning, 'abort' stops the run. Exit
+# non-zero only when the run genuinely should not go ahead.
 exit 0

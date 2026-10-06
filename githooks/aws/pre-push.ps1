@@ -89,7 +89,7 @@ Get-ChildItem -Path $LogDir -Filter 'hook-pre-push-upload-*.log' -ErrorAction Si
 
 function Write-Log {
     param([string]$Message)
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+    $line = Hide-UrlSecret "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
     Write-Host $line
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
@@ -153,9 +153,9 @@ function Get-CanonicalPkgList {
         ForEach-Object {
             $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
             if ($content -match '(?m)^\s+location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-                $set[($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')] = $true
+                $rel = ConvertTo-PkgRelativePath $Matches[1]; if ($rel) { $set[$rel] = $true }
             } elseif ($content -match '(?m)^installer_item_location:\s*[''"]?([^''"\r\n]+?)[''"]?\s*$') {
-                $set[($Matches[1].Trim().TrimStart('\', '/') -replace '\\', '/')] = $true
+                $rel = ConvertTo-PkgRelativePath $Matches[1]; if ($rel) { $set[$rel] = $true }
             }
         }
     return $set.Keys
@@ -193,7 +193,8 @@ function Remove-S3Orphan {
     foreach ($line in $listing) {
         $parts = ($line -split '\s+', 4)
         if ($parts.Count -lt 4) { continue }
-        $key = $parts[3] -replace '^deployment/pkgs/', ''
+        $key = $parts[3] -replace '^.*?deployment/pkgs/', ''
+        if (-not (ConvertTo-PkgRelativePath $key)) { continue }
         if ($key -match '\.(nupkg|msi|exe|zip|intunewin|pkg)$' -or (Test-IsSidecarName $key)) { $s3Keys += ($key -replace '\\', '/') }
     }
     Write-Log "  $($s3Keys.Count) objects in S3"
@@ -226,9 +227,9 @@ function Remove-S3Orphan {
     if (-not $DryRun) {
         foreach ($o in $orphans) {
             & $AwsExe s3 rm "$S3Url/deployment/pkgs/$o" --region $AwsRegion --only-show-errors 2>&1 |
-                ForEach-Object { Add-Content -Path $LogFile -Value $_ }
-            $lp = Join-Path $PkgsDir ($o -replace '/', '\')
-            if (Test-Path $lp) { Remove-Item $lp -Force -ErrorAction SilentlyContinue }
+                ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
+            $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $o
+            if ($lp -and (Test-Path -LiteralPath $lp)) { Remove-Item $lp -Force -ErrorAction SilentlyContinue }
         }
     } else {
         Write-Log "[DRY RUN] Would delete $($orphans.Count) orphans"
@@ -281,15 +282,32 @@ function Get-ChangedPaths {
 }
 
 # ── targeted path upload ─────────────────────────────────────────────────────
+# Only a package that tracked pkgsinfo references, or an image under
+# deployment/icons, and only by a validated path.
 if ($TargetPaths.Count -gt 0) {
     Write-Log ">> targeted path upload — $($TargetPaths.Count) path(s)"
     Test-AwsAuth
+    $tracked = @{}
+    foreach ($l in (Get-TrackedPkgLocation -RepoRoot $RepoRoot)) { $tracked[$l.ToLower()] = $true }
+    $iconsDir = Join-Path $Deployment 'icons'
     foreach ($t in $TargetPaths) {
-        $t = $t -replace '\\', '/'
-        if ($t -notlike 'deployment/*') { $t = "deployment/pkgs/$t" }
-        Write-Log "  -> uploading: $t"
-        & $AwsExe s3 cp (Join-Path $RepoRoot ($t -replace '/', '\')) "$S3Url/$t" `
-            --region $AwsRegion --only-show-errors 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+        $t = ([string]$t) -replace '\\', '/'
+        if ($t -like 'deployment/icons/*') {
+            $name = ConvertTo-PkgRelativePath ($t.Substring('deployment/icons/'.Length))
+            $local = if ($name) { Resolve-PkgLocalPath -PkgsDir $iconsDir -RelPath $name } else { $null }
+            $isImage = $name -and @($script:IconPatterns | Where-Object { $name -like $_ }).Count -gt 0
+            if (-not $local -or -not $isImage) { Write-Log "  REFUSED: $t is not an image under deployment/icons"; continue }
+            $remote = "deployment/icons/$name"
+        } else {
+            $rel = ConvertTo-PkgRelativePath $t
+            $local = if ($rel) { Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $rel } else { $null }
+            if (-not $local) { Write-Log "  REFUSED: $t is not a safe path under deployment/pkgs"; continue }
+            if (-not $tracked.ContainsKey($rel.ToLower())) { Write-Log "  REFUSED: $rel is not referenced by tracked pkgsinfo"; continue }
+            $remote = "deployment/pkgs/$rel"
+        }
+        Write-Log "  -> uploading: $remote"
+        & $AwsExe s3 cp $local "$S3Url/$remote" `
+            --region $AwsRegion --only-show-errors 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     }
     Write-Log 'Targeted path upload complete'
     Complete-Log
@@ -355,7 +373,7 @@ if (-not $makecatalogs) {
         $pathArgs = @()
         foreach ($line in $missing) { $p = Get-MissingPkgPath -Line $line; if ($p) { $pathArgs += '--path'; $pathArgs += $p } }
         $postMerge = Join-Path $HookDir 'post-merge.ps1'
-        if (Test-Path $postMerge) { & pwsh -NoProfile -File $postMerge @pathArgs 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ } }
+        if (Test-Path $postMerge) { & pwsh -NoProfile -File $postMerge @pathArgs 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) } }
 
         $tmp2 = [System.IO.Path]::GetTempFileName()
         try {
@@ -405,17 +423,52 @@ if (Test-PathIsReparsePoint $PkgsDir) {
     exit 1
 }
 
+# What leaves the machine, and nothing else:
+#   • deployment/pkgs: only files that tracked pkgsinfo reference, each by a
+#     validated path. Untracked or ignored files in the cache stay local.
+#   • deployment/icons: image files only.
+#   • installers/<name>/payload and packages/<name>/payload: only for projects
+#     whose build-info.yaml is tracked, minus sidecars and anything shaped
+#     like a credential or key (.env, *.pem, *.key, *.pfx, ...).
+# No --acl is ever passed; objects get the bucket's default (keep Block Public
+# Access on).
+#
 # Additive only: no --delete. Nobody holds all of deployment/pkgs locally, so
 # deleting what a partial cache lacks would empty the bucket. The orphan
 # cleanup is the one delete path.
-$syncOpts = @('--exclude', '.DS_Store', '--exclude', '*/.DS_Store', '--exclude', '._*', '--exclude', '*/._*', '--only-show-errors', '--region', $AwsRegion)
+$syncOpts = @()
+foreach ($pat in $script:UploadDenyPatterns) { $syncOpts += @('--exclude', $pat, '--exclude', "*/$pat") }
+$syncOpts += @('--only-show-errors', '--region', $AwsRegion)
 if ($DryRun) { $syncOpts += '--dryrun' }
 
-function Sync-Up([string]$Local, [string]$Remote) {
+function Sync-Up([string]$Local, [string]$Remote, [string[]]$Extra = @()) {
     if (-not (Test-Path -LiteralPath $Local)) { return }
     Write-Log ">> syncing $Remote"
-    & $AwsExe s3 sync $Local "$S3Url/$Remote" @syncOpts 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value $_ }
+    & $AwsExe s3 sync $Local "$S3Url/$Remote" @Extra @syncOpts 2>&1 | ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
     if ($LASTEXITCODE -ne 0) { Write-Log "ERROR: aws s3 sync of $Remote failed ($LASTEXITCODE)"; Complete-Log; exit 1 }
+}
+
+# Packages are immutable: only keys not already in S3 are uploaded.
+function Send-ReferencedPkgs {
+    $rels = @(Get-TrackedPkgLocation -RepoRoot $RepoRoot | Where-Object {
+        $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $_
+        $lp -and (Test-Path -LiteralPath $lp -PathType Leaf) -and -not (Test-IsSidecarName $_)
+    })
+    if ($rels.Count -eq 0) { Write-Log 'No referenced packages present locally to upload'; return }
+    $existing = @{}
+    foreach ($line in (& $AwsExe s3 ls "$S3Url/deployment/pkgs/" --recursive --region $AwsRegion 2>$null)) {
+        $parts = ($line -split '\s+', 4)
+        if ($parts.Count -eq 4) { $existing[($parts[3] -replace '^.*?deployment/pkgs/', '').ToLower()] = $true }
+    }
+    $todo = @($rels | Where-Object { -not $existing.ContainsKey($_.ToLower()) })
+    Write-Log ">> $($todo.Count) of $($rels.Count) referenced package(s) not yet in S3"
+    foreach ($rel in $todo) {
+        if ($DryRun) { Write-Log "  [DRY RUN] $rel"; continue }
+        $lp = Resolve-PkgLocalPath -PkgsDir $PkgsDir -RelPath $rel
+        & $AwsExe s3 cp $lp "$S3Url/deployment/pkgs/$rel" --region $AwsRegion --only-show-errors 2>&1 |
+            ForEach-Object { Add-Content -Path $LogFile -Value (Hide-UrlSecret $_) }
+        if ($LASTEXITCODE -ne 0) { Write-Log "ERROR: upload of $rel failed ($LASTEXITCODE)"; Complete-Log; exit 1 }
+    }
 }
 
 # installers/<name>/payload and packages/<name>/payload are the source trees
@@ -426,15 +479,21 @@ function Sync-Payloads {
         $topDir = Join-Path $RepoRoot $top
         if (-not (Test-Path -LiteralPath $topDir)) { continue }
         foreach ($item in Get-ChildItem -LiteralPath $topDir -Directory -ErrorAction SilentlyContinue) {
+            if ($item.Name -match '[^A-Za-z0-9._ -]' -or $item.Name.StartsWith('.')) { continue }
+            git -C $RepoRoot ls-files --error-unmatch -- "$top/$($item.Name)/build-info.yaml" 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Log "  skip $top/$($item.Name): build-info.yaml is not tracked"; continue }
             $payload = Join-Path $item.FullName 'payload'
             if (Test-Path -LiteralPath $payload) { Sync-Up $payload "$top/$($item.Name)/payload/" }
         }
     }
 }
 
+$iconFilter = @('--exclude', '*')
+foreach ($pat in $script:IconPatterns) { $iconFilter += @('--include', $pat) }
+
 $all = $changedPaths -in @('all', 'upload')
-if ($all -or $changedPaths -match 'pkgs')     { Sync-Up $PkgsDir 'deployment/pkgs/' }
-if ($all -or $changedPaths -match 'icons')    { Sync-Up (Join-Path $Deployment 'icons') 'deployment/icons/' }
+if ($all -or $changedPaths -match 'pkgs')     { Send-ReferencedPkgs }
+if ($all -or $changedPaths -match 'icons')    { Sync-Up (Join-Path $Deployment 'icons') 'deployment/icons/' $iconFilter }
 if ($all -or $changedPaths -match 'payloads') { Sync-Payloads }
 if ($all -or $changedPaths -match 'pkgs')     { Remove-S3Orphan }
 if ($all) { Remove-ImportedBuildArtifact -RepoRoot $RepoRoot -PkgsDir $PkgsDir -DryRun:$DryRun }

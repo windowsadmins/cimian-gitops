@@ -150,6 +150,26 @@ exit 0
         Set-Content "$fixture/state/race-sha" -Value $otherHash -NoNewline
         if ((Invoke-Hook) -eq 0) { throw 'expected differing concurrent race winner to block' }
 
+        # Unsafe locations are refused before they become a path or a key,
+        # even when a file really exists at the target.
+        [IO.File]::WriteAllBytes("$fixture/outside.msi", $packageBytes)
+        foreach ($bad in '../../outside.msi', '..\..\outside.msi', 'apps/../../../outside.msi', 'C:\Windows\outside.msi', '\\server\share\outside.msi', '//server/share/outside.msi') {
+            @"
+name: Test
+installer:
+  type: msi
+  size: 2
+  location: '$bad'
+  hash: $expectedHash
+"@ | Set-Content -LiteralPath "$fixture/deployment/pkgsinfo/apps/Test.yaml" -NoNewline
+            git -C $fixture commit -qam "unsafe $bad"
+            $refLine = "refs/heads/test $((git -C $fixture rev-parse HEAD).Trim()) refs/heads/test $baseSha"
+            Reset-Remote -Exists $false
+            if ((Invoke-Hook) -eq 0) { throw "expected unsafe location '$bad' to block" }
+            if (Test-Path "$fixture/state/uploaded") { throw "unsafe location '$bad' must not upload" }
+            if (Test-Path "$fixture/state/azcopy-args") { throw "unsafe location '$bad' must not reach the uploader" }
+        }
+
         # A nopkg item has no payload and must pass with nothing in storage.
         @"
 name: Test

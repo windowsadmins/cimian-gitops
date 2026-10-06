@@ -52,11 +52,15 @@ fs.mkdirSync(CONFIG.logDir, { recursive: true });
 const log = fs.createWriteStream(path.join(CONFIG.logDir, 'listener.log'),       { flags: 'a' });
 const err = fs.createWriteStream(path.join(CONFIG.logDir, 'listener_error.log'), { flags: 'a' });
 
-console.log   = m => log.write(`[${ts()}] ${m}\n`);
-console.error = m => err.write(`[${ts()}] ${m}\n`);
+// Keep credentials out of the logs: bearer tokens and presigned-URL
+// signatures, wherever they turn up.
+const redact = t => String(t)
+  .replace(/Bearer [^"\s]+/g, 'Bearer ***')
+  .replace(/(X-Amz-(?:Signature|Security-Token|Credential)=)[^&"\s]+/gi, '$1***');
 
-// Keep bearer tokens out of the logs, in case git or a token command echoes one.
-const redact = t => String(t).replace(/Bearer [^"\s]+/g, 'Bearer ***');
+// Every log line goes through redact, so no call site can forget it.
+console.log   = m => log.write(`[${ts()}] ${redact(m)}\n`);
+console.error = m => err.write(`[${ts()}] ${redact(m)}\n`);
 
 async function run(cmd, opts = {}) {
   try {

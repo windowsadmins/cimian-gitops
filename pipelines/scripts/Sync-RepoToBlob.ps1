@@ -22,7 +22,12 @@ referencing it.
 param(
     [Parameter(Mandatory)] [ValidatePattern('^[a-z0-9]{3,24}$')] [string] $StorageAccount,
     [Parameter(Mandatory)] [ValidatePattern('^[a-z0-9-]{3,63}$')] [string] $Container,
-    [Parameter(Mandatory)] [string] $RepoRoot
+    [Parameter(Mandatory)] [string] $RepoRoot,
+    # Upload deployment/pkgs only, add-only. For a pipeline that imports
+    # packages and commits their pkgsinfo: the packages must be in storage
+    # before the commit that references them, and the metadata trees are
+    # published later by push-to-production from the committed state.
+    [switch] $PackagesOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +46,11 @@ function Sync([string] $Source, [string] $Dest, [bool] $Mirror) {
     $del = if ($Mirror) { 'true' } else { 'false' }
     azcopy sync $src "$base/$Dest`?$sas" --recursive --delete-destination=$del
     if ($LASTEXITCODE -ne 0) { throw "azcopy sync $Source failed ($LASTEXITCODE)" }
+}
+
+if ($PackagesOnly) {
+    Sync 'deployment/pkgs' 'deployment/pkgs' $false
+    return
 }
 
 foreach ($d in 'catalogs', 'manifests', 'pkgsinfo', 'icons') {

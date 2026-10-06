@@ -9,9 +9,10 @@ inventory.csv
    └── projections/project.py
          ├── intune.csv  ──> consumers/intune.py   builds the group ladder
          ├── cimian.csv  ──> consumers/cimian.py   publishes computers.csv
-         ├── munki.csv   ──> the Munki repo's equivalent
-         └── mdm.csv     ──> Autopilot routing
+         └── mdm.csv     ──> your Autopilot routing (no consumer ships here)
 ```
+
+[munki-gitops](https://github.com/rodchristiansen/munki-gitops) runs the same projection for its macOS rows.
 
 ## Three properties that make this survivable
 
@@ -67,12 +68,36 @@ modes are worth naming:
   the desired set degrades to near-zero, which is a well-formed answer that
   empties every group on a green build. Caught by `desired_floor`.
 - **A runaway change.** A bulk edit that moves eight hundred machines because
-  somebody sorted a spreadsheet wrong. Caught by `removal_cap`, which skips the
-  suspicious group and carries on with the rest rather than failing everything.
+  somebody sorted a spreadsheet wrong. Caught by `removal_cap`.
 
-Both read their thresholds from the environment. Set them from *your* baseline
-and record that baseline in a comment. Defaults inherited from someone else's
-estate are decorations, not guards.
+### Abort, don't skip
+
+The sample's `removal_cap` skips the group that tripped it and carries on with
+the rest. That is the gentler of two stances, and in production it is the
+wrong one. A degraded input rarely damages one group; it damages all of them a
+little, and skipping the worst offender converges the rest to a bad answer.
+
+The stance that holds up is to validate the input first and abort the whole run
+on anything suspicious, before a single write:
+
+- **Row floor.** The inventory has at least N rows, set from your fleet size.
+- **Non-blank ratio.** At least 95% of rows carry a usable serial and `usage`.
+- **Resolution ratio.** At least 95% of a group's serials resolve to an Entra
+  device object. Fewer means Graph returned a partial answer.
+- **Per-group shrink.** No group loses more than half its members in one run,
+  past a small absolute allowance for tiny groups.
+- **Total shrink.** No run removes more than a fifth of all memberships.
+- **An explicit override** for the day a large move is real, scoped to named
+  groups, so an unexpected shrink anywhere else still aborts.
+
+Either everything converges or nothing does, and a failed run leaves membership
+exactly as it was. Run the sync as a reviewed step, with the plan from
+`--what-if` attached to the pull request that changes inventory, so the person
+approving a large move sees it before it happens.
+
+Thresholds come from the environment. Set them from *your* baseline and record
+that baseline in a comment. Defaults inherited from someone else's estate are
+decorations, not guards.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -88,7 +113,7 @@ estate are decorations, not guards.
 python3 tests/test_group_ladder.py
 ```
 
-Eleven assertions against an in-memory Graph: the ladder shape, the
+Twelve tests against an in-memory Graph: the ladder shape, the
 manifest-path round trip, retired devices never being added, a second run
 changing nothing, a collapsed parse removing nothing, a runaway removal being
 capped, and whatIf writing nothing.

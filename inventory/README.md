@@ -75,13 +75,27 @@ rows:
 
 | Target | Rows | Consumed by |
 |---|---|---|
-| `cimian.csv` | Windows | `../enrollment/consumers/cimian.py` |
-| `munki.csv` | Macintosh | the Munki repo's equivalent consumer |
-| `intune.csv` | all | `../enrollment/consumers/intune.py` — builds the group ladder |
-| `mdm.csv` | all | `../enrollment/consumers/mdm.py` — ADE / Autopilot routing |
+| `cimian.csv` | Windows | `../enrollment/consumers/cimian.py`, which publishes it as the repo's `computers.csv` |
+| `intune.csv` | all | `../enrollment/consumers/intune.py`, which builds the group ladder |
+| `mdm.csv` | all | Your Autopilot or ADE routing. No consumer ships here; it is a starting point for one. |
+
+The Munki half lives in [munki-gitops](https://github.com/rodchristiansen/munki-gitops),
+whose own `project.py` writes `munki.csv` for macOS rows.
+
+`cimian.csv` keeps a fixed column order ending `fleet,hostname`. The published
+`computers.csv` is diffed run to run, and anything that reads it by position
+breaks on a reorder, so append new columns at the end.
 
 Add a target by adding an entry to `COLUMNS` in `project.py`, and to `PLATFORM`
 if it only wants one platform.
+
+## Your inventory system may already be the contract
+
+Nothing here requires a twelve-column master file. If your asset system
+already exports a CSV per device, as Snipe-IT does with `assets.csv`, project
+from that export and map its column names onto these. Extra columns, such as a
+`category` of Desktop or Laptop, are fine to carry for a consumer that uses
+them; keep them out of the contract until something does.
 
 ## Sample data
 

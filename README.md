@@ -116,9 +116,11 @@ that first, before handing it anything.
 
 **Guards.** Adding is safe; removing is not. A degraded parse yields an *empty*
 desired set rather than an error — a well-formed answer that removes everything
-on a green build. So there is a floor on the desired set, a cap on how much one
-run may remove, ownership markers so only this pipeline's own objects are
-touched, and `whatIf` as a supported way to run.
+on a green build. So the input is validated before anything is written (row
+floors, resolution ratios, per-group and total shrink limits), a run that fails
+any check aborts whole rather than converging part of the estate, ownership
+markers keep the pipeline to its own objects, and `whatIf` is a supported way
+to run. See [`enrollment/README.md`](enrollment/README.md#guards).
 
 ## Cimian vs Munki
 

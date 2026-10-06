@@ -9,6 +9,8 @@ and invalidate the CDN path so it is visible now rather than at TTL.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import logging
 import os
 import pathlib
@@ -22,12 +24,28 @@ log = logging.getLogger(__name__)
 
 REPO_PATH = os.getenv("CIMIAN_COMPUTERS_CSV_PATH", "deployment/enroll/computers.csv")
 
+# The published column order. A projection that arrives in any other shape is
+# bad input, not something to publish and let the fleet discover.
+EXPECTED_HEADER = [
+    "serial", "catalog", "area", "location", "asset", "usage",
+    "status", "allocation", "username", "platform", "fleet", "hostname",
+]
+
+# Refuse to publish fewer rows than this. Set it from your own fleet size: a
+# projection that suddenly shrinks is a broken export far more often than a
+# fleet that halved overnight.
+MIN_ROWS = int(os.getenv("CIMIAN_MIN_ROWS", "1"))
+
 
 def converge(csv_text: str, *, what_if: bool = False) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s | %(message)s")
+    header = next(csv.reader(io.StringIO(csv_text)), [])
+    if header != EXPECTED_HEADER:
+        log.error("Refusing to publish: header is %s, expected %s.", header, EXPECTED_HEADER)
+        return 1
     rows = csvdiff.parse(csv_text)
-    if not rows:
-        log.error("Refusing to publish an empty computers.csv.")
+    if len(rows) < max(MIN_ROWS, 1):
+        log.error("Refusing to publish %d row(s); the floor is %d.", len(rows), max(MIN_ROWS, 1))
         return 1
 
     log.info("%d device row(s) for the Cimian repo.", len(rows))

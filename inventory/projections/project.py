@@ -17,11 +17,14 @@ import csv
 import pathlib
 import sys
 
-# Column sets per target. Order is the output column order.
+# Column sets per target. Order is the output column order. Keep cimian's fixed
+# (it ends fleet, hostname): the published computers.csv is diffed run to run,
+# and anything that reads it by position, such as a quick shell script on a
+# client, breaks on a reorder. Append new columns at the end.
 COLUMNS: dict[str, list[str]] = {
     "cimian": [
         "serial", "catalog", "area", "location", "asset", "usage",
-        "status", "allocation", "username", "platform", "hostname", "fleet",
+        "status", "allocation", "username", "platform", "fleet", "hostname",
     ],
     "intune": [
         "serial", "catalog", "area", "location", "asset", "usage",

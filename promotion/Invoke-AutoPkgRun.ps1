@@ -5,9 +5,27 @@ recipes in promotion/recipe_list.yaml.
 
 .DESCRIPTION
 Windows only. Uses the AutoPkg fork with the Cimian importer
-(rodchristiansen/autopkg, branch add-cimian-support), run from a clone with
-the Python on PATH. AutoPkg on Windows reads its preferences from
-%LOCALAPPDATA%\AutoPkg\config.json, which this writes.
+(rodchristiansen/autopkg), run from a clone with the Python on PATH. AutoPkg
+on Windows reads its preferences from %LOCALAPPDATA%\AutoPkg\config.json,
+which this writes.
+
+Everything it executes is pinned, because recipes run arbitrary download and
+processing steps:
+
+  - AutoPkg itself is checked out at -AutoPkgCommit, a reviewed 40-character
+    SHA, and the checkout is verified.
+  - Each recipe repo in recipe_list.yaml is written url@sha and checked out at
+    that commit.
+  - Python dependencies install from requirements-autopkg.txt with
+    --require-hashes.
+  - Recipes run only as overrides carrying ParentRecipeTrustInfo, with
+    FAIL_RECIPES_WITHOUT_TRUST_INFO set, so a parent recipe that changed since
+    its override was reviewed fails instead of running. Refresh trust with
+    `autopkg update-trust-info <override>` after reading the diff.
+
+Run this in a job that holds no write credentials. GitHub downloads use
+AUTOPKG_GITHUB_TOKEN if set, which should be a read-only token, never the
+job's own GITHUB_TOKEN.
 
 New packages land in deployment/pkgs and new pkgsinfo in deployment/pkgsinfo.
 Run promotion/stamp_metadata.py afterwards so the promoter knows they came
@@ -24,7 +42,8 @@ param(
     [string[]] $Recipes,
     [string] $WorkDir = (Join-Path ([IO.Path]::GetTempPath()) 'autopkg'),
     [string] $AutoPkgRepo = 'https://github.com/rodchristiansen/autopkg.git',
-    [string] $AutoPkgBranch = 'add-cimian-support'
+    # The add-cimian-support branch as reviewed. Bump deliberately.
+    [ValidatePattern('^[0-9a-f]{40}$')] [string] $AutoPkgCommit = 'd868068e7559912d483f760f9696d3344ca9ac79'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,23 +69,35 @@ foreach ($r in $run) {
 
 # ── AutoPkg itself ───────────────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-$autopkgDir = Join-Path $WorkDir 'autopkg'
-if (-not (Test-Path $autopkgDir)) {
-    git clone --quiet --depth 1 --branch $AutoPkgBranch $AutoPkgRepo $autopkgDir
-    if ($LASTEXITCODE -ne 0) { throw 'Could not clone AutoPkg' }
+function Get-PinnedRepo([string] $Url, [string] $Commit, [string] $Dest) {
+    # autocrlf off: trust info hashes the recipe files byte for byte, and a
+    # CRLF checkout would change every hash.
+    if (-not (Test-Path (Join-Path $Dest '.git'))) {
+        git -c core.autocrlf=false init --quiet $Dest
+        git -C $Dest config core.autocrlf false
+        git -C $Dest remote add origin $Url
+    }
+    git -C $Dest fetch --quiet --depth 1 origin $Commit
+    if ($LASTEXITCODE -ne 0) { throw "Could not fetch $Url at $Commit" }
+    git -C $Dest checkout --quiet --force FETCH_HEAD
+    $head = (git -C $Dest rev-parse HEAD).Trim()
+    if ($head -ne $Commit) { throw "$Url checked out at $head, expected $Commit" }
 }
-python -m pip install --quiet pyyaml appdirs certifi lxml generateDS
+
+$autopkgDir = Join-Path $WorkDir 'autopkg'
+Get-PinnedRepo $AutoPkgRepo $AutoPkgCommit $autopkgDir
+python -m pip install --quiet --require-hashes --only-binary=:all: -r (Join-Path $RepoRoot 'promotion/requirements-autopkg.txt')
 if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
 $autopkg = Join-Path $autopkgDir 'Code/autopkg'
 
 # ── Recipe repos, named the way AutoPkg names them (com.github.owner.repo) ───
 $repoDir = Join-Path $WorkDir 'RecipeRepos'
 New-Item -ItemType Directory -Force -Path $repoDir | Out-Null
-foreach ($url in $repos) {
-    if ($url -notmatch '^https://github\.com/([\w.-]+)/([\w.-]+?)(\.git)?$') { throw "Unsupported recipe repo URL $url" }
-    $dest = Join-Path $repoDir "com.github.$($Matches[1]).$($Matches[2])"
-    if (Test-Path $dest) { git -C $dest pull --quiet --ff-only } else { git clone --quiet --depth 1 $url $dest }
-    if ($LASTEXITCODE -ne 0) { throw "Could not fetch $url" }
+foreach ($entry in $repos) {
+    if ($entry -notmatch '^(https://github\.com/([\w.-]+)/([\w.-]+?)(\.git)?)@([0-9a-f]{40})$') {
+        throw "Recipe repo '$entry' must be https://github.com/<owner>/<repo>.git@<40-character commit>"
+    }
+    Get-PinnedRepo $Matches[1] $Matches[5] (Join-Path $repoDir "com.github.$($Matches[2]).$($Matches[3])")
 }
 
 # ── Preferences ──────────────────────────────────────────────────────────────
@@ -80,9 +111,11 @@ $prefs = [ordered]@{
     CIMIAN_PKGINFO_FILE_EXTENSION = 'yaml'
     CIMIIMPORT_PATH               = $CimiimportPath
     CURL_PATH                     = "$env:SystemRoot\System32\curl.exe"
+    FAIL_RECIPES_WITHOUT_TRUST_INFO = $true
 }
-# GitHub-hosted downloads share the agent's anonymous 60/hour quota without one.
-if ($env:GITHUB_TOKEN) { $prefs.GITHUB_TOKEN = $env:GITHUB_TOKEN }
+# GitHub-hosted downloads share the agent's anonymous 60/hour quota without a
+# token. Only ever a read-only one: recipes can read their preferences.
+if ($env:AUTOPKG_GITHUB_TOKEN) { $prefs.GITHUB_TOKEN = $env:AUTOPKG_GITHUB_TOKEN }
 $prefsDir = Join-Path $env:LOCALAPPDATA 'AutoPkg'
 New-Item -ItemType Directory -Force -Path $prefsDir | Out-Null
 $prefs | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $prefsDir 'config.json') -Encoding UTF8

@@ -1,0 +1,12 @@
+Identifier: local.cimian.PowerShell-arm64
+Input:
+  ARCHITECTURE: arm64
+  NAME: PowerShell
+ParentRecipe: com.github.autopkg.cimian.PowerShell-arm64
+ParentRecipeTrustInfo:
+  non_core_processors: {}
+  parent_recipes:
+    com.github.autopkg.cimian.PowerShell-arm64:
+      git_hash: 0bf346b7b654100d1f3b806eff7b05f7a9c5249d
+      path: ~/RecipeRepos/com.github.windowsadmins.autopkg-recipes/PowerShell/PowerShell-arm64.cimian.recipe.yaml
+      sha256_hash: 944fa175075c47e4b04fd74c8aa2983e2dfe3b444f2159ec890e5e0253c4202b

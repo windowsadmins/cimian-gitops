@@ -1,22 +1,26 @@
-# AutoPkg recipes the scheduled run imports. These are the upstream recipe
-# identifiers. To change what an import does, such as the catalogs it lands in
-# (Development and Testing is the usual start; promoter.py moves it on from
-# there), make an override with `autopkg make-override <identifier>`, keep it
-# in promotion/RecipeOverrides/, and list the override's identifier here.
+# AutoPkg recipes the scheduled run imports.
+#
+# Every recipe runs as an override in RecipeOverrides/, never as the upstream
+# recipe directly. An override pins the parent recipe's hash in
+# ParentRecipeTrustInfo; the run fails any recipe whose parent has changed
+# since, so nothing new executes until someone reads the change and runs
+# `autopkg update-trust-info <override>`. Overrides are also where you set the
+# catalogs an import lands in. Make one with
+# `autopkg make-override --format yaml <identifier>`.
+#
+# Recipe repos are pinned to a commit (url@sha). Bump the commit and refresh
+# the trust info together.
 #
 # Recipes for Cimian: https://github.com/windowsadmins/autopkg-recipes
-#
-# Universal recipes (one installer for both architectures) have no suffix;
-# architecture-specific ones are named -x64 and -arm64.
 
 repos:
-  - https://github.com/windowsadmins/autopkg-recipes.git
+  - https://github.com/windowsadmins/autopkg-recipes.git@4c51218afd3bd314a357031bc657a9ce17f18474
 
 recipes:
-  - com.github.autopkg.cimian.Chrome
-  - com.github.autopkg.cimian.Firefox-x64
-  - com.github.autopkg.cimian.Firefox-arm64
-  - com.github.autopkg.cimian.7-Zip-x64
-  - com.github.autopkg.cimian.7-Zip-arm64
-  - com.github.autopkg.cimian.PowerShell-x64
-  - com.github.autopkg.cimian.PowerShell-arm64
+  - local.cimian.Chrome
+  - local.cimian.Firefox-x64
+  - local.cimian.Firefox-arm64
+  - local.cimian.7-Zip-x64
+  - local.cimian.7-Zip-arm64
+  - local.cimian.PowerShell-x64
+  - local.cimian.PowerShell-arm64

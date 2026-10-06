@@ -8,7 +8,9 @@ managed_installs:
 - Firefox
 
 conditional_items:
-- condition: os_vers_major >= 11
+# Windows 11 builds are 10.0.22000 and up. Assignment filters have no ordered
+# comparison, so the condition matches the build prefix rather than >= 11.
+- condition: os_version BEGINSWITH "10.0.2"
   managed_installs:
   - ExampleAppNeedingWindows11
   managed_profiles:

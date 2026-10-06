@@ -76,7 +76,7 @@ rows:
 | Target | Rows | Consumed by |
 |---|---|---|
 | `cimian.csv` | Windows | `../enrollment/consumers/cimian.py`, which publishes it as the repo's `computers.csv` |
-| `intune.csv` | all | `../enrollment/consumers/intune.py`, which builds the group ladder |
+| `intune.csv` | all | `enrollment/consumers/intune.py` in [intune-gitops](https://github.com/windowsadmins/intune-gitops), which builds the group ladder |
 | `mdm.csv` | all | Your Autopilot or ADE routing. No consumer ships here; it is a starting point for one. |
 
 The Munki half lives in [munki-gitops](https://github.com/rodchristiansen/munki-gitops),

@@ -31,10 +31,12 @@ The legacy flow was a shared admin box, one central share, many hands, no pipeli
 | Path | What it is |
 |------|------------|
 | `githooks/` | PowerShell git hooks (`azure/` + `aws/`) that validate pkgsinfo on commit, download referenced packages on pull, and sync the repo to cloud storage on push. Opt-in per clone. |
-| `pipelines/azure/` | Azure DevOps pipelines: `push-to-production-*` (build catalogs + sync storage), `bootstrap-to-intune.yml` (the centerpiece), `autopkg.yml`, `promote-catalogs.yml` and `infrastructure.yml`. |
+| `pipelines/azure/` | Azure DevOps pipelines: `push-to-production-*` (build catalogs + sync storage), `bootstrap-to-intune.yml` (the centerpiece), `autopkg.yml`, `promote-catalogs.yml`, `prod-checks.yml` and `infrastructure.yml`. |
 | `pipelines/github/` | The same pipelines as GitHub Actions workflows, with actions pinned to commits and OIDC confined to protected environments. |
 | `pipelines/scripts/` | Helpers the pipelines share: a retrying GitHub Releases client, the hash-pinned Cimian tools installer, the missing-package gate, the blob sync and the Intune Win32 app publisher. |
 | `promotion/` | AutoPkg import and staged catalog promotion: pinned, trust-checked recipes, the promoter and its rules, and the checks that keep an import to the first stage. |
+| `quality/` | Pkgsinfo structure and category lints (the pre-push hook calls the category gate) and a read-only production check for catalog drift. |
+| `remediations/` | Intune proactive remediation pairs for Cimian clients: a stuck watcher, stale preferences, the last BootstrapMate run. |
 | `infrastructure/` | Terraform for the storage account, Front Door and Key Vault behind the repo, with token-checked client access. |
 | `provisioning/` | The BootstrapMate first-boot manifest the bootstrap pipeline publishes. |
 | `preflight/cimian/` | A cimipkg sample that installs a Cimian preflight script run before each check. |

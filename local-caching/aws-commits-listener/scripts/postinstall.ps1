@@ -39,6 +39,15 @@ try {
     $ErrorActionPreference = 'Stop'
 }
 
+# The logs can hold repo URLs and error detail, so only SYSTEM (which runs
+# the task) and Administrators may read them. Inheritance is cut so a
+# permissive parent ACL does not leak back in. Keep this path in step with
+# CIMIAN_LOG_DIR if you override it.
+$logDir = 'C:\ProgramData\ManagedInstalls\logs\listener'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+icacls $logDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "Could not restrict $logDir ($LASTEXITCODE)"; exit 1 }
+
 schtasks /Create /TN $taskName /XML "$taskXml" /F | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Error "schtasks /Create failed ($LASTEXITCODE)"; exit 1 }
 schtasks /Run    /TN $taskName | Out-Null

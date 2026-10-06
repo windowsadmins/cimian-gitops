@@ -88,6 +88,11 @@ variables:
   - name: cdnEndpoint
     value: '<frontdoor-endpoint>'
 
+# Every parameter and variable reaches a script through env: and is read as
+# $env:X. Nothing is pasted into script text by template or macro expansion, so
+# a crafted value cannot become code. The inputs are also checked for shape
+# before anything runs.
+
 stages:
 
 # ── 1. Build ──────────────────────────────────────────────────────────────────
@@ -98,27 +103,44 @@ stages:
     - job: build_bootstrapmate
       steps:
       - pwsh: |
-          . '$(Build.SourcesDirectory)/pipelines/scripts/GitHubRelease.ps1'
-          $out = '$(Build.ArtifactStagingDirectory)/intune'
+          $ErrorActionPreference = 'Stop'
+          if ($env:BM_TAG -notmatch '^(latest|v?\d{4}\.\d{2}\.\d{2}\.\d{4})$') { throw "bootstrapMateTag '$env:BM_TAG' is not 'latest' or a release tag" }
+          if ($env:ASSIGN_GROUP_ID -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'assignmentGroupId is not a GUID' }
+          if ($env:ESP_NAME -notmatch '^[A-Za-z0-9 ._()-]{0,128}$') { throw 'espName may only contain letters, digits, spaces and ._()-' }
+        displayName: 'Validate parameters'
+        env:
+          BM_TAG: ${{ parameters.bootstrapMateTag }}
+          ASSIGN_GROUP_ID: ${{ parameters.assignmentGroupId }}
+          ESP_NAME: ${{ parameters.espName }}
+
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          . (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/GitHubRelease.ps1')
+          $out = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'intune'
           $got = Get-GitHubReleaseAsset -Owner 'bootstrapmate' -Repo 'bootstrapmate-windows' `
-            -Tag '${{ parameters.bootstrapMateTag }}' -AssetGlob 'BootstrapMate-x64-*.msi' -DestDir $out
+            -Tag $env:BM_TAG -AssetGlob 'BootstrapMate-x64-*.msi' -DestDir $out
           Write-Host "Fetched $($got.Name) from $($got.Tag)"
-          Write-Host "##vso[task.setvariable variable=msiPath]$($got.Path)"
         displayName: 'Fetch BootstrapMate x64 MSI'
         env:
+          BM_TAG: ${{ parameters.bootstrapMateTag }}
           GITHUB_TOKEN: $(GitHubReadToken)
 
       - task: AzureCLI@2
         displayName: 'Sign BootstrapMate MSI'
+        env:
+          SIGNING_VAULT: $(signingKeyVault)
+          SIGNING_CERT_NAME: $(signingCertName)
         inputs:
           azureSubscription: '$(azureServiceConnection)'
           scriptType: pscore
           scriptLocation: inlineScript
           inlineScript: |
             $ErrorActionPreference = 'Stop'
-            $b64 = az keyvault secret show --vault-name '$(signingKeyVault)' --name '$(signingCertName)' --query value -o tsv
-            if (-not $b64) { throw "Empty secret '$(signingCertName)' in '$(signingKeyVault)'" }
-            $pfx = Join-Path '$(Agent.TempDirectory)' 'signing.pfx'
+            $msi = Get-ChildItem (Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'intune') -Filter 'BootstrapMate-x64-*.msi' | Select-Object -First 1
+            if (-not $msi) { throw 'No BootstrapMate MSI to sign' }
+            $b64 = az keyvault secret show --vault-name $env:SIGNING_VAULT --name $env:SIGNING_CERT_NAME --query value -o tsv
+            if ($LASTEXITCODE -ne 0 -or -not $b64) { throw "Could not read secret $env:SIGNING_CERT_NAME from $env:SIGNING_VAULT" }
+            $pfx = Join-Path $env:AGENT_TEMPDIRECTORY 'signing.pfx'
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($b64))
             try { $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My }
             finally { Remove-Item $pfx -Force }
@@ -131,17 +153,19 @@ stages:
             # try the next one before giving up.
             $signed = $false
             foreach ($tsa in 'http://timestamp.digicert.com', 'http://timestamp.sectigo.com', 'http://timestamp.globalsign.com/tsa/r6advanced1') {
-              & $signtool.FullName sign /sha1 $cert.Thumbprint /fd SHA256 /tr $tsa /td SHA256 /q '$(msiPath)'
+              & $signtool.FullName sign /sha1 $cert.Thumbprint /fd SHA256 /tr $tsa /td SHA256 /q $msi.FullName
               if ($LASTEXITCODE -eq 0) { $signed = $true; Write-Host "Signed, timestamped by $tsa"; break }
               Write-Host "signtool failed with $tsa ($LASTEXITCODE); trying the next server"
             }
             if (-not $signed) { throw 'Signing failed against every timestamp server' }
+            if ((Get-AuthenticodeSignature $msi.FullName).Status -ne 'Valid') { throw 'The signed MSI does not verify' }
 
       - pwsh: |
-          $tool = "$(Agent.TempDirectory)/IntuneWinAppUtil.exe"
+          $ErrorActionPreference = 'Stop'
+          $tool = Join-Path $env:AGENT_TEMPDIRECTORY 'IntuneWinAppUtil.exe'
           Invoke-WebRequest -UseBasicParsing -OutFile $tool `
             'https://github.com/microsoft/Microsoft-Win32-Content-Prep-Tool/raw/master/IntuneWinAppUtil.exe'
-          $msi = Get-Item '$(msiPath)'
+          $msi = Get-ChildItem (Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'intune') -Filter 'BootstrapMate-x64-*.msi' | Select-Object -First 1
           & $tool -c $msi.DirectoryName -s $msi.FullName -o $msi.DirectoryName -q
           if ($LASTEXITCODE -ne 0) { throw "IntuneWinAppUtil failed ($LASTEXITCODE)" }
           Get-ChildItem "$($msi.DirectoryName)/*.intunewin" | ForEach-Object { Write-Host "Built $($_.Name)" }
@@ -162,6 +186,13 @@ stages:
       steps:
       - task: AzureCLI@2
         displayName: 'Upload management.json, purge CDN'
+        env:
+          STORAGE_ACCOUNT: $(storageAccount)
+          STORAGE_CONTAINER: $(storageContainer)
+          CDN_RG: $(cdnResourceGroup)
+          CDN_PROFILE: $(cdnProfile)
+          CDN_ENDPOINT: $(cdnEndpoint)
+          MANAGEMENT_JSON_URL: $(managementJsonUrl)
         inputs:
           azureSubscription: '$(azureServiceConnection)'
           scriptType: pscore
@@ -171,12 +202,12 @@ stages:
             # management.json is the first-boot manifest BootstrapMate reads at
             # the ESP. It lists only what must land before the desktop appears;
             # Cimian pulls the full app stack afterward. See provisioning/README.md.
-            $manifest = '$(Build.SourcesDirectory)/provisioning/public/management.json'
-            Get-Content $manifest -Raw | ConvertFrom-Json | Out-Null   # refuse to publish invalid JSON
+            $manifest = Join-Path $env:BUILD_SOURCESDIRECTORY 'provisioning/public/management.json'
+            $want = Get-Content $manifest -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 20 -Compress   # refuses invalid JSON
 
             for ($try = 1; ; $try++) {
               az storage blob upload --auth-mode login `
-                --account-name '$(storageAccount)' --container-name '$(storageContainer)' `
+                --account-name $env:STORAGE_ACCOUNT --container-name $env:STORAGE_CONTAINER `
                 --name 'bootstrap/management.json' --file $manifest `
                 --content-type 'application/json' --overwrite true
               if ($LASTEXITCODE -eq 0) { break }
@@ -185,15 +216,14 @@ stages:
             }
 
             az afd endpoint purge `
-              --resource-group '$(cdnResourceGroup)' --profile-name '$(cdnProfile)' `
-              --endpoint-name '$(cdnEndpoint)' --content-paths '/bootstrap/management.json'
+              --resource-group $env:CDN_RG --profile-name $env:CDN_PROFILE `
+              --endpoint-name $env:CDN_ENDPOINT --content-paths '/bootstrap/management.json'
             if ($LASTEXITCODE -ne 0) { throw "CDN purge failed ($LASTEXITCODE)" }
 
             # Prove the edge now serves what was uploaded.
-            $want = (Get-Content $manifest -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 20 -Compress)
-            $have = (Invoke-RestMethod -Uri "$(managementJsonUrl)?nocache=$(Build.BuildId)" | ConvertTo-Json -Depth 20 -Compress)
-            if ($want -ne $have) { throw "$(managementJsonUrl) does not match the repo copy after the purge" }
-            Write-Host "Verified $(managementJsonUrl)"
+            $have = Invoke-RestMethod -Uri "$($env:MANAGEMENT_JSON_URL)?nocache=$($env:BUILD_BUILDID)" | ConvertTo-Json -Depth 20 -Compress
+            if ($want -ne $have) { throw "$env:MANAGEMENT_JSON_URL does not match the repo copy after the purge" }
+            Write-Host "Verified $env:MANAGEMENT_JSON_URL"
 
 # ── 3. Deploy ─────────────────────────────────────────────────────────────────
 - ${{ if in(parameters.stages, 'Full', 'Deploy') }}:
@@ -208,14 +238,19 @@ stages:
 
       - task: AzureCLI@2
         displayName: 'Publish Win32 LOB'
+        env:
+          ASSIGN_GROUP_ID: ${{ parameters.assignmentGroupId }}
+          ESP_NAME: ${{ parameters.espName }}
         inputs:
           azureSubscription: '$(azureServiceConnection)'
           scriptType: pscore
           scriptLocation: inlineScript
           inlineScript: |
+            $ErrorActionPreference = 'Stop'
             $token = az account get-access-token --resource 'https://graph.microsoft.com' --query accessToken -o tsv
-            $intuneWin = Get-ChildItem '$(Pipeline.Workspace)/bootstrapmate-intune' -Filter '*.intunewin' -Recurse | Select-Object -First 1
+            if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Could not get a Graph token for the service connection' }
+            $intuneWin = Get-ChildItem (Join-Path $env:PIPELINE_WORKSPACE 'bootstrapmate-intune') -Filter '*.intunewin' -Recurse | Select-Object -First 1
             if (-not $intuneWin) { throw 'No .intunewin in the build artifact' }
-            & '$(Build.SourcesDirectory)/pipelines/scripts/Publish-IntuneWin32App.ps1' `
+            & (Join-Path $env:BUILD_SOURCESDIRECTORY 'pipelines/scripts/Publish-IntuneWin32App.ps1') `
               -Token $token -IntuneWin $intuneWin.FullName -DisplayName 'BootstrapMate' `
-              -AssignmentGroupId '${{ parameters.assignmentGroupId }}' -EspName '${{ parameters.espName }}'
+              -AssignmentGroupId $env:ASSIGN_GROUP_ID -EspName $env:ESP_NAME

@@ -16,7 +16,8 @@ The whole Microsoft Graph flow for an MSI wrapped with IntuneWinAppUtil:
   5. Repair the ESP blocking list. Deleting the old app leaves its id in the
      ESP's selectedMobileAppIds, and a deleted id there means the ESP no
      longer waits for the bootstrapper at all. The old ids are swapped for
-     the new one.
+     the new one. A missing or ambiguous ESP, or a repair that does not read
+     back, fails the run.
 
 Every Graph call and every upload block is retried on throttling and transient
 errors, because a long upload over a shared hosted agent hits both.
@@ -35,18 +36,14 @@ param(
     [Parameter(Mandatory)] [string] $DisplayName,
     [string] $Description = 'First-boot bootstrapper. Delivered once at the ESP; Cimian orchestrates everything else from the GitOps repo.',
     [string] $Publisher = '<your-org>',
-    [Parameter(Mandatory)] [string] $AssignmentGroupId,
-    [string] $EspName,
+    [Parameter(Mandatory)] [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')] [string] $AssignmentGroupId,
+    [ValidatePattern('^[A-Za-z0-9 ._()-]{0,128}$')] [string] $EspName,
     [string] $GraphBase = 'https://graph.microsoft.com/beta'
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Token)) { throw 'Empty Graph token' }
 $headers = @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' }
-
-function Write-PipelineWarning([string] $Message) {
-    if ($env:GITHUB_ACTIONS -eq 'true') { Write-Host "::warning::$Message" }
-    else { Write-Host "##vso[task.logissue type=warning]$Message" }
-}
 
 function Invoke-Graph {
     param(
@@ -188,7 +185,15 @@ try {
     }
 } finally { $stream.Dispose() }
 $blockList = '<?xml version="1.0" encoding="utf-8"?><BlockList>' + (($ids | ForEach-Object { "<Latest>$_</Latest>" }) -join '') + '</BlockList>'
-Invoke-RestMethod -Uri "$sas&comp=blocklist" -Method PUT -Headers @{ 'content-type' = 'text/plain; charset=UTF-8' } -Body $blockList | Out-Null
+for ($try = 1; ; $try++) {
+    try {
+        Invoke-RestMethod -Uri "$sas&comp=blocklist" -Method PUT -Headers @{ 'content-type' = 'text/plain; charset=UTF-8' } -Body $blockList | Out-Null
+        break
+    } catch {
+        if ($try -ge 5) { throw "Block list commit failed after $try attempts: $($_.Exception.Message)" }
+        Start-Sleep -Seconds (10 * $try)
+    }
+}
 Write-Host "Uploaded $($ids.Count) block(s)"
 
 Invoke-Graph -Uri "$fileUrl/commit" -Method POST -Body @{ fileEncryptionInfo = @{
@@ -222,10 +227,11 @@ if ($EspName) {
     $espFilter = [Uri]::EscapeDataString("displayName eq '$($EspName.Replace("'", "''"))'")
     $esp = (Invoke-Graph -Uri "$GraphBase/deviceManagement/deviceEnrollmentConfigurations?`$filter=$espFilter").value |
         Where-Object { $_.'@odata.type' -eq '#microsoft.graph.windows10EnrollmentCompletionPageConfiguration' } |
-        Select-Object -First 1
-    if (-not $esp) {
-        Write-PipelineWarning "ESP '$EspName' not found; its blocking list was not updated, so it will not wait for $DisplayName."
-        exit 1
+        Select-Object -First 2
+    if (@($esp).Count -ne 1) {
+        # Fail, not warn: the app was just recreated under a new id, so an ESP
+        # left unrepaired silently stops waiting for the bootstrapper.
+        throw "Expected exactly one ESP named '$EspName', found $(@($esp).Count). The new app $appId is not in any ESP blocking list."
     }
     $current = @($esp.selectedMobileAppIds | Where-Object { $_ })
     $wanted = @(@($current | Where-Object { $_ -notin $old }) + $appId | Sort-Object -Unique)
@@ -241,6 +247,14 @@ if ($EspName) {
     }
     $patch.selectedMobileAppIds = $wanted
     Invoke-Graph -Uri "$GraphBase/deviceManagement/deviceEnrollmentConfigurations/$($esp.id)" -Method PATCH -Body $patch | Out-Null
+
+    # Read it back: a PATCH that returns 2xx without persisting would otherwise
+    # pass as a repair.
+    $after = @((Invoke-Graph -Uri "$GraphBase/deviceManagement/deviceEnrollmentConfigurations/$($esp.id)").selectedMobileAppIds)
+    $stale = @($after | Where-Object { $_ -in $old })
+    if ($after -notcontains $appId -or $stale.Count -gt 0) {
+        throw "ESP '$EspName' blocking list did not take: has $($after -join ', '), wanted $appId without $($old -join ', ')"
+    }
     Write-Host "ESP '$EspName': blocking on $appId; dropped $($dropped.Count) deleted id(s)"
 }
 

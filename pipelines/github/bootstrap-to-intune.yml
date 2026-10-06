@@ -46,14 +46,29 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # Inputs reach scripts only through env: and are read as $env:X, never
+    # pasted into script text with ${{ }}, so a crafted input cannot become
+    # code. Their shape is checked before anything runs.
+    - name: Validate inputs
+      shell: pwsh
+      env:
+        BM_TAG: ${{ inputs.bootstrapMateTag }}
+        ASSIGN_GROUP_ID: ${{ inputs.assignmentGroupId }}
+        ESP_NAME: ${{ inputs.espName }}
+      run: |
+        if ($env:BM_TAG -notmatch '^(latest|v?\d{4}\.\d{2}\.\d{2}\.\d{4})$') { throw "bootstrapMateTag '$env:BM_TAG' is not 'latest' or a release tag" }
+        if ($env:ASSIGN_GROUP_ID -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'assignmentGroupId is not a GUID' }
+        if ($env:ESP_NAME -notmatch '^[A-Za-z0-9 ._()-]{0,128}$') { throw 'espName may only contain letters, digits, spaces and ._()-' }
+
     - name: Fetch BootstrapMate x64 MSI
       shell: pwsh
       env:
         GITHUB_TOKEN: ${{ github.token }}
+        BM_TAG: ${{ inputs.bootstrapMateTag }}
       run: |
         . ./pipelines/scripts/GitHubRelease.ps1
         $got = Get-GitHubReleaseAsset -Owner 'bootstrapmate' -Repo 'bootstrapmate-windows' `
-          -Tag '${{ inputs.bootstrapMateTag }}' -AssetGlob 'BootstrapMate-x64-*.msi' -DestDir "$env:RUNNER_TEMP\intune"
+          -Tag $env:BM_TAG -AssetGlob 'BootstrapMate-x64-*.msi' -DestDir "$env:RUNNER_TEMP\intune"
         "MSI_PATH=$($got.Path)" | Out-File -Append $env:GITHUB_ENV
         Write-Host "Fetched $($got.Name) from $($got.Tag)"
 
@@ -81,6 +96,7 @@ jobs:
           Write-Host "signtool failed with $tsa ($LASTEXITCODE); trying the next server"
         }
         if (-not $signed) { throw 'Signing failed against every timestamp server' }
+        if ((Get-AuthenticodeSignature $env:MSI_PATH).Status -ne 'Valid') { throw 'The signed MSI does not verify' }
 
     - name: Build .intunewin
       shell: pwsh
@@ -125,8 +141,16 @@ jobs:
           if ($try -ge 4) { throw "management.json upload failed after $try attempts" }
           Start-Sleep -Seconds (10 * $try)
         }
-        aws cloudfront create-invalidation --distribution-id $env:CLOUDFRONT_DISTRIBUTION_ID --paths '/bootstrap/management.json'
+        $inv = aws cloudfront create-invalidation --distribution-id $env:CLOUDFRONT_DISTRIBUTION_ID --paths '/bootstrap/management.json' | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "CloudFront invalidation failed ($LASTEXITCODE)" }
+        aws cloudfront wait invalidation-completed --distribution-id $env:CLOUDFRONT_DISTRIBUTION_ID --id $inv.Invalidation.Id
+        if ($LASTEXITCODE -ne 0) { throw 'CloudFront invalidation did not complete' }
+
+        # Prove the edge now serves what was uploaded.
+        $want = Get-Content $manifest -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 20 -Compress
+        $have = Invoke-RestMethod -Uri "$($env:MANAGEMENT_JSON_URL)?nocache=$($env:GITHUB_RUN_ID)" | ConvertTo-Json -Depth 20 -Compress
+        if ($want -ne $have) { throw "$env:MANAGEMENT_JSON_URL does not match the repo copy after the invalidation" }
+        Write-Host "Verified $env:MANAGEMENT_JSON_URL"
 
   deploy:
     name: Win32 LOB to Intune + assign + ESP
@@ -149,9 +173,13 @@ jobs:
 
     - name: Publish Win32 LOB
       shell: pwsh
+      env:
+        ASSIGN_GROUP_ID: ${{ inputs.assignmentGroupId }}
+        ESP_NAME: ${{ inputs.espName }}
       run: |
         $token = az account get-access-token --resource 'https://graph.microsoft.com' --query accessToken -o tsv
+        if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Could not get a Graph token' }
         $intuneWin = Get-ChildItem "$env:RUNNER_TEMP\intune" -Filter '*.intunewin' -Recurse | Select-Object -First 1
         if (-not $intuneWin) { throw 'No .intunewin in the build artifact' }
         ./pipelines/scripts/Publish-IntuneWin32App.ps1 -Token $token -IntuneWin $intuneWin.FullName `
-          -DisplayName 'BootstrapMate' -AssignmentGroupId '${{ inputs.assignmentGroupId }}' -EspName '${{ inputs.espName }}'
+          -DisplayName 'BootstrapMate' -AssignmentGroupId $env:ASSIGN_GROUP_ID -EspName $env:ESP_NAME'

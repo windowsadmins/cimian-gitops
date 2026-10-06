@@ -12,7 +12,7 @@ pull request and apply it from `main` behind an approval.
 | Storage account, `repo` container (private)          | The Cimian repo: `deployment/{catalogs,manifests,pkgsinfo,icons,pkgs}`. The push pipelines sync here.                             |
 | `public` container (anonymous blob read, no listing) | Files BootstrapMate fetches at the ESP, under `bootstrap/`, before the machine has a credential.                                  |
 | Key Vault, RBAC authorization                        | No access policies. Holds the client token and anything else the pipelines read, such as the signing certificate.                 |
-| Front Door Standard profile and endpoint             | `/deployment/*` to the `repo` container, `/bootstrap/*` to `public/bootstrap`. Optional custom domain with a managed certificate. |
+| Front Door Standard profile and endpoint             | `/deployment/*` to the `repo` container, `/bootstrap/*` to the `public` container, where the files sit under `bootstrap/`. Optional custom domain with a managed certificate. |
 | Front Door rule set | Packages cached for a year; swaps the client token for a read-only SAS. |
 | WAF policy (Standard, custom rule) | Rejects `/deployment/` requests without the client token with a 403, before the cache. |
 | Role assignments                                     | The pipeline identity gets Storage Blob Data Contributor, Key Vault Secrets User and CDN Endpoint Contributor.                    |

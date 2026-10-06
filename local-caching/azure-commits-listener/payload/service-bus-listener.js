@@ -57,8 +57,7 @@ const err = fs.createWriteStream(path.join(CONFIG.logDir, 'listener_error.log'),
 console.log   = m => log.write(`[${ts()}] ${m}\n`);
 console.error = m => err.write(`[${ts()}] ${m}\n`);
 
-// Keep bearer tokens out of the logs, including the command line that exec
-// echoes back in its error message.
+// Keep bearer tokens out of the logs, in case git or a token command echoes one.
 const redact = t => String(t).replace(/Bearer [^"\s]+/g, 'Bearer ***');
 
 async function run(cmd, opts = {}) {
@@ -96,9 +95,17 @@ async function refreshGitToken() {
   console.log('Refreshed git access token');
 }
 
-function gitAuthArgs() {
-  // Passed per command, never written to a global git config.
-  return gitToken ? `-c http.extraHeader="Authorization: Bearer ${gitToken}" ` : '';
+function gitEnv() {
+  // The header goes in through git's environment config (GIT_CONFIG_COUNT and
+  // friends), never on the command line, where any local user could read it
+  // from the process list, and never into a git config file on disk.
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  if (gitToken) {
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+    env.GIT_CONFIG_VALUE_0 = `Authorization: Bearer ${gitToken}`;
+  }
+  return env;
 }
 
 function isAuthFailure(e) {
@@ -107,14 +114,13 @@ function isAuthFailure(e) {
 
 async function git(args, opts = {}) {
   if (CONFIG.gitTokenCmd && Date.now() - gitTokenAt >= TOKEN_TTL_MS) await refreshGitToken();
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
   try {
-    await run(`git ${gitAuthArgs()}${args}`, { ...opts, env });
+    await run(`git ${args}`, { ...opts, env: gitEnv() });
   } catch (e) {
     if (!CONFIG.gitTokenCmd || !isAuthFailure(e)) throw e;
     console.log('Git authentication failed; refreshing the token and retrying once');
     await refreshGitToken();
-    await run(`git ${gitAuthArgs()}${args}`, { ...opts, env });
+    await run(`git ${args}`, { ...opts, env: gitEnv() });
   }
 }
 

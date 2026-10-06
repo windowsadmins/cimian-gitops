@@ -1,0 +1,114 @@
+# Checks for this repo itself: the offline tests, a syntax pass over every
+# script and pipeline, and the workflow pin and permission rules. Nothing here
+# reaches a tenant, a storage account or a bucket.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyyaml
+      - name: Enrollment tests
+        working-directory: enrollment
+        run: python -m unittest discover -s tests -v
+      - name: Intune tests
+        working-directory: intune
+        run: python -m unittest discover -s tests -v
+      - name: Promotion tests
+        run: python -m unittest discover -s promotion/tests -v
+      - name: Inventory projection
+        run: |
+          python inventory/projections/project.py inventory/inventory.csv --out-dir "$RUNNER_TEMP/out"
+          head -1 "$RUNNER_TEMP/out/cimian.csv" | tr -d '\r' | grep -qx 'serial,catalog,area,location,asset,usage,status,allocation,username,platform,fleet,hostname'
+      - name: Intune condition lint on the sample manifests
+        working-directory: intune
+        run: python -m stages.lint_conditions manifests/
+      - name: Workflow pins and permissions
+        run: python .github/scripts/check_workflows.py
+      - name: Every YAML file parses
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for p in pathlib.Path('.').rglob('*.y*ml'):
+              if '.git' in p.parts:
+                  continue
+              try:
+                  list(yaml.safe_load_all(p.read_text(encoding='utf-8')))
+              except yaml.YAMLError as exc:
+                  bad.append(f'{p}: {exc}')
+          print('\n'.join(bad) or 'All YAML parses.')
+          sys.exit(1 if bad else 0)
+          PY
+
+  powershell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyyaml
+      - name: Every script parses
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -File -Include *.ps1, *.psm1 | Where-Object FullName -notmatch '[\\/]\.git[\\/]' | ForEach-Object {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { $bad++; $errors | ForEach-Object { Write-Host "::error file=$($_.Extent.File),line=$($_.Extent.StartLineNumber)::$($_.Message)" } }
+          }
+          if ($bad) { throw "$bad script(s) failed to parse" }
+      - name: Git hook tests
+        shell: pwsh
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+          foreach ($t in Get-ChildItem githooks/tests -Filter *.ps1) {
+            Write-Host "== $($t.Name)"
+            pwsh -NoProfile -File $t.FullName
+            if ($LASTEXITCODE -ne 0) { throw "$($t.Name) failed" }
+          }
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Listener scripts parse
+        run: for f in local-caching/*/payload/*.js; do node --check "$f"; done
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      - working-directory: infrastructure
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate

@@ -114,6 +114,9 @@ jobs:
   publish:
     needs: import
     runs-on: windows-latest
+    # Protected environment: the federated credential's subject is this
+    # environment, so only this job can mint an Azure token.
+    environment: cimian-production
     permissions:
       contents: write
       id-token: write

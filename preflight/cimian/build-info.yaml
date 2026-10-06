@@ -1,12 +1,19 @@
+# cimipkg build-info. ${TIMESTAMP} becomes a YYYY.MM.DD.HHMM version at build
+# time, and ${SIGNING_CERT_SUBJECT} is read from the environment or a .env file
+# beside this one, so no certificate name lives in the repo.
+#
+# The payload is flat: everything under payload/ lands directly in
+# install_location, so payload/preflight.ps1 becomes
+# C:\Program Files\Cimian\preflight.ps1.
 product:
   name: CimianPreflight
-  version: 2025.06.06
+  version: ${TIMESTAMP}
   developer: <your-org>
-  identifier: com.domain.cimian.preflight
+  identifier: com.example.cimian.preflight
+  category: Management
   description: >-
     Installs a Cimian preflight.ps1 that runs before each managedsoftwareupdate
     check. Sample/template — edit preflight.ps1 for your environment.
-architecture: x64
-install_location: C:\Program Files\Cimian\
+install_location: 'C:\Program Files\Cimian'
 postinstall_action: none
-signing_certificate: <signing-cert-subject-or-thumbprint>
+signing_certificate: ${SIGNING_CERT_SUBJECT}

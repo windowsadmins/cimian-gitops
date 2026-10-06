@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import shutil
@@ -52,10 +53,15 @@ class CheckImportRepo(unittest.TestCase):
         self.assertEqual(self.check().returncode, 1)
 
 
+def pkgsinfo_for(catalogs, location, digest, created_by="autopkg"):
+    return pkgsinfo(catalogs, created_by) + f"installer:\n  location: {location}\n  hash: {digest}\n"
+
+
 class CheckImportArtifact(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = pathlib.Path(self.tmp.name)
+        self.root = pathlib.Path(self.tmp.name) / "art"
+        self.root.mkdir()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -63,15 +69,33 @@ class CheckImportArtifact(unittest.TestCase):
     def put(self, rel, text="x"):
         p = self.root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_bytes(text.encode() if isinstance(text, str) else text)
+        return p
 
-    def check(self):
-        return subprocess.run([sys.executable, str(CHECK), "--artifact", str(self.root)], capture_output=True, text=True)
+    def put_import(self, name="App-1.0.msi", payload=b"binary", catalogs=("Testing",), digest=None):
+        self.put(f"deployment/pkgs/apps/{name}", payload)
+        digest = digest or hashlib.sha256(payload).hexdigest()
+        self.put("deployment/pkgsinfo/apps/App.yaml", pkgsinfo_for(list(catalogs), f"\\apps\\{name}", digest))
 
-    def test_packages_and_pkgsinfo_pass(self):
-        self.put("deployment/pkgs/apps/App-1.0.msi")
-        self.put("deployment/pkgsinfo/apps/App.yaml", pkgsinfo(["Testing"]))
-        self.assertEqual(self.check().returncode, 0)
+    def check(self, *extra):
+        return subprocess.run([sys.executable, str(CHECK), "--artifact", str(self.root), *extra],
+                              capture_output=True, text=True)
+
+    def base_repo(self, files):
+        base = pathlib.Path(self.tmp.name) / "base"
+        base.mkdir()
+        subprocess.run(["git", "-C", str(base), "init", "-q"], check=True)
+        for rel, text in files.items():
+            p = base / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text)
+        subprocess.run(["git", "-C", str(base), "add", "-A"], check=True)
+        return base
+
+    def test_matching_import_passes(self):
+        self.put_import()
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_catalogs_are_rejected(self):
         self.put("deployment/catalogs/Production.yaml")
@@ -86,8 +110,57 @@ class CheckImportArtifact(unittest.TestCase):
         self.assertEqual(self.check().returncode, 1)
 
     def test_promoted_pkgsinfo_is_rejected(self):
-        self.put("deployment/pkgsinfo/apps/App.yaml", pkgsinfo(["Staging"]))
+        self.put_import(catalogs=("Staging",))
         self.assertEqual(self.check().returncode, 1)
+
+    def test_unreferenced_package_is_rejected(self):
+        self.put("deployment/pkgs/apps/Stray.msi", b"stray")
+        self.assertIn("no pkgsinfo", self.check().stderr)
+
+    def test_hash_mismatch_is_rejected(self):
+        self.put_import(digest="0" * 64)
+        self.assertIn("SHA-256", self.check().stderr)
+
+    def test_existing_package_is_rejected_case_insensitively(self):
+        self.put_import()
+        keys = pathlib.Path(self.tmp.name) / "keys.txt"
+        keys.write_text("deployment/pkgs/APPS/app-1.0.MSI\n")
+        self.assertIn("already in storage", self.check("--existing-pkgs", str(keys)).stderr)
+
+    def test_rewrite_of_promoted_pkgsinfo_is_rejected(self):
+        self.put_import()
+        base = self.base_repo({"deployment/pkgsinfo/apps/App.yaml": pkgsinfo(["Testing", "Staging", "Production"])})
+        self.assertIn("already promoted", self.check("--base", str(base)).stderr)
+
+    def test_rewrite_of_first_stage_pkgsinfo_passes(self):
+        self.put_import()
+        base = self.base_repo({"deployment/pkgsinfo/apps/App.yaml": pkgsinfo(["Testing"])})
+        r = self.check("--base", str(base))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_case_only_collision_is_rejected(self):
+        self.put_import()
+        base = self.base_repo({"deployment/pkgsinfo/apps/app.yaml": pkgsinfo(["Testing"])})
+        self.assertIn("only by case", self.check("--base", str(base)).stderr)
+
+    def test_traversal_location_is_rejected(self):
+        self.put("deployment/pkgsinfo/apps/App.yaml", pkgsinfo_for(["Testing"], "..\\..\\pipelines\\x.msi", "0" * 64))
+        self.assertIn("safe relative path", self.check().stderr)
+
+    def test_hidden_and_non_ascii_segments_are_rejected(self):
+        self.put("deployment/pkgs/apps/._App.msi", b"x")
+        self.put("deployment/pkgs/apps/Äpp.msi", b"x")
+        self.assertEqual(self.check().stderr.count("plain ASCII"), 2)
+
+    def test_symlink_is_rejected(self):
+        target = self.put("deployment/pkgs/apps/Real.msi", b"x")
+        (self.root / "deployment/pkgs/apps/Link.msi").symlink_to(target)
+        self.assertIn("not a regular file", self.check().stderr)
+
+    def test_hardlink_is_rejected(self):
+        target = self.put("deployment/pkgs/apps/Real.msi", b"x")
+        os.link(target, self.root / "deployment/pkgs/apps/Hard.msi")
+        self.assertIn("hard links", self.check().stderr)
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")

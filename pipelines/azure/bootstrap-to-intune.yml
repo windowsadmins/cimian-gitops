@@ -76,8 +76,10 @@ variables:
 
   - name: storageAccount
     value: 'examplecimianstorage'
+  # The anonymous-read container BootstrapMate fetches from before the
+  # machine has any credential; see infrastructure/main.tf.
   - name: storageContainer
-    value: 'repo'
+    value: 'public'
   - name: managementJsonUrl
     value: 'https://cimian.example.com/bootstrap/management.json'
 

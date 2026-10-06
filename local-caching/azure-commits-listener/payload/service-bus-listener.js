@@ -6,6 +6,10 @@
 // • Every cloud-specific value comes from the environment — NEVER hard-code a
 //   connection string or queue name in this file.
 // • Uses "azcopy sync" for fast, resumable transfers.
+// • Prefers the machine's managed identity (an Azure VM or an Arc-enabled
+//   server) for both Service Bus and storage, so no secret exists at all. Give
+//   the identity Azure Service Bus Data Receiver on the subscription and
+//   Storage Blob Data Reader on the container.
 // ----------------------------------------------------------------------
 
 import fs   from 'fs';
@@ -13,18 +17,28 @@ import path from 'path';
 import util from 'util';
 import { exec } from 'child_process';
 import { ServiceBusClient } from '@azure/service-bus';
+import { DefaultAzureCredential } from '@azure/identity';
 
 const execAsync = util.promisify(exec);
 
 // ────────────────
 // CONFIG — driven entirely by environment variables. Set these in the
 // Scheduled Task definition or a machine-level env block. Examples:
-//   CIMIAN_SB_CONNECTION = Endpoint=sb://<namespace>.servicebus.windows.net/;...
+//   CIMIAN_SB_NAMESPACE  = <namespace>.servicebus.windows.net   (managed identity)
 //   CIMIAN_BLOB_URL      = https://<storage-account>.blob.core.windows.net/repo
-//   CIMIAN_BLOB_SAS      = ?sv=...&sig=...
+//   CIMIAN_MSI_CLIENT_ID = <client id of a user-assigned identity, if not system-assigned>
+//
+// Fallbacks for a machine with no managed identity. Both are secrets, and the
+// SAS has to go on azcopy's command line, where local administrators can see
+// it in the process list; keep it read-only, scoped to the container and
+// short-lived.
+//   CIMIAN_SB_CONNECTION = Endpoint=sb://<namespace>.servicebus.windows.net/;...
+//   CIMIAN_BLOB_SAS      = ?sv=...&sp=rl&sig=...
 // ────────────────
 const CONFIG = {
-  sbConnection : process.env.CIMIAN_SB_CONNECTION,
+  sbNamespace  : process.env.CIMIAN_SB_NAMESPACE || '',
+  sbConnection : process.env.CIMIAN_SB_CONNECTION || '',
+  msiClientId  : process.env.CIMIAN_MSI_CLIENT_ID || '',
   sbTopic      : process.env.CIMIAN_SB_TOPIC || 'cimian-commits',
   sbSub        : process.env.CIMIAN_SB_SUB   || 'cache-server-1',
 
@@ -43,8 +57,11 @@ const CONFIG = {
   logDir       : process.env.CIMIAN_LOG_DIR || 'C:\\ProgramData\\ManagedInstalls\\logs\\listener',
 };
 
-for (const k of ['sbConnection', 'repoUrl', 'blobUrl']) {
+for (const k of ['repoUrl', 'blobUrl']) {
   if (!CONFIG[k]) { console.error(`Missing required env for CONFIG.${k}`); process.exit(2); }
+}
+if (!CONFIG.sbNamespace && !CONFIG.sbConnection) {
+  console.error('Set CIMIAN_SB_NAMESPACE (managed identity) or CIMIAN_SB_CONNECTION'); process.exit(2);
 }
 
 // ────────────────
@@ -54,11 +71,17 @@ fs.mkdirSync(CONFIG.logDir, { recursive: true });
 const log = fs.createWriteStream(path.join(CONFIG.logDir, 'listener.log'),       { flags: 'a' });
 const err = fs.createWriteStream(path.join(CONFIG.logDir, 'listener_error.log'), { flags: 'a' });
 
-console.log   = m => log.write(`[${ts()}] ${m}\n`);
-console.error = m => err.write(`[${ts()}] ${m}\n`);
+// Keep credentials out of the logs: bearer tokens, SAS signatures and
+// connection-string keys, wherever they turn up (command output, exec error
+// messages that echo the command line, SDK errors).
+const redact = t => String(t)
+  .replace(/Bearer [^"\s]+/g, 'Bearer ***')
+  .replace(/([?&]sig=)[^&"\s]+/gi, '$1***')
+  .replace(/(SharedAccessKey=)[^;"\s]+/gi, '$1***');
 
-// Keep bearer tokens out of the logs, in case git or a token command echoes one.
-const redact = t => String(t).replace(/Bearer [^"\s]+/g, 'Bearer ***');
+// Every log line goes through redact, so no call site can forget it.
+console.log   = m => log.write(`[${ts()}] ${redact(m)}\n`);
+console.error = m => err.write(`[${ts()}] ${redact(m)}\n`);
 
 async function run(cmd, opts = {}) {
   try {
@@ -70,10 +93,20 @@ async function run(cmd, opts = {}) {
   }
 }
 
+// With no SAS, azcopy signs in with the managed identity by itself.
+function azcopyEnv() {
+  const env = { ...process.env };
+  if (!CONFIG.sas) {
+    env.AZCOPY_AUTO_LOGIN_TYPE = 'MSI';
+    if (CONFIG.msiClientId) env.AZCOPY_MSI_CLIENT_ID = CONFIG.msiClientId;
+  }
+  return env;
+}
+
 async function syncFromBlob(sub) {
   const src = `${CONFIG.blobUrl}/deployment/${sub}${CONFIG.sas}`;
   const dst = `${CONFIG.workingCopy}\\deployment\\${sub}`;
-  await run(`"${CONFIG.azcopy}" sync "${src}" "${dst}" --recursive --delete-destination=true`);
+  await run(`"${CONFIG.azcopy}" sync "${src}" "${dst}" --recursive --delete-destination=true`, { env: azcopyEnv() });
 }
 
 // ────────────────
@@ -142,7 +175,10 @@ async function refreshRepo() {
 async function main() {
   await ensureRepo();
 
-  const sb = new ServiceBusClient(CONFIG.sbConnection);
+  const sb = CONFIG.sbNamespace
+    ? new ServiceBusClient(CONFIG.sbNamespace, new DefaultAzureCredential(
+        CONFIG.msiClientId ? { managedIdentityClientId: CONFIG.msiClientId } : {}))
+    : new ServiceBusClient(CONFIG.sbConnection);
   const rx = sb.createReceiver(CONFIG.sbTopic, CONFIG.sbSub);
 
   rx.subscribe({

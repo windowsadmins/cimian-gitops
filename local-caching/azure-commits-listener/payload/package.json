@@ -6,6 +6,7 @@
   "description": "Azure Service Bus listener that refreshes a Windows Cimian caching server.",
   "main": "service-bus-listener.js",
   "dependencies": {
-    "@azure/service-bus": "^7.9.4"
+    "@azure/service-bus": "^7.9.4",
+    "@azure/identity": "^4.13.0"
   }
 }

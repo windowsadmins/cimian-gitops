@@ -1,0 +1,131 @@
+# infrastructure.yml — plan and apply ../../infrastructure with Terraform.
+#
+# GitHub Actions twin of pipelines/azure/infrastructure.yml. Copy it to
+# .github/workflows/ in your Cimian repo.
+#
+# Plan runs on every pull request and push. Apply runs only from main, in the
+# "cimian-infrastructure" environment: add required reviewers to that
+# environment (Settings > Environments) and the apply waits for a person to
+# read the plan. It applies the exact plan file the plan job uploaded.
+#
+# Auth is OpenID Connect: ARM_USE_OIDC makes the azurerm provider and backend
+# exchange the job's GitHub token for an Entra token. Add federated credentials
+# to the app registration for both repo:<owner>/<repo>:pull_request and
+# repo:<owner>/<repo>:environment:cimian-infrastructure. Client, tenant and
+# subscription ids are identifiers, not secrets, so they live in repository
+# variables.
+
+name: Cimian infrastructure
+
+on:
+  pull_request:
+    paths: ['infrastructure/**']
+  push:
+    branches: [main]
+    paths: ['infrastructure/**']
+  schedule:
+    - cron: '0 6 1 * *'   # reissue the client SAS before it nears expiry
+  workflow_dispatch:
+
+concurrency:
+  group: cimian-infrastructure
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.9.8'
+  TF_IN_AUTOMATION: 'true'
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  STATE_RG: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+  STATE_SA: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+  STATE_CONTAINER: tfstate
+  STATE_KEY: cimian.tfstate
+  TF_VAR_pipeline_principal_id: ${{ vars.PIPELINE_PRINCIPAL_ID }}
+  TF_VAR_storage_account_name: ${{ vars.STORAGE_ACCOUNT }}
+
+defaults:
+  run:
+    working-directory: infrastructure
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=$STATE_RG" \
+            -backend-config="storage_account_name=$STATE_SA" \
+            -backend-config="container_name=$STATE_CONTAINER" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Format and validate
+        run: |
+          terraform fmt -check -recursive
+          terraform validate
+
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -lock-timeout=300s -detailed-exitcode -out=tfplan
+          rc=$?
+          set -e
+          case $rc in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit $rc ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.has_changes == 'true'
+        with:
+          name: tfplan
+          path: infrastructure/tfplan
+          retention-days: 5
+
+  apply:
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: cimian-infrastructure   # add required reviewers here
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: infrastructure
+
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=$STATE_RG" \
+            -backend-config="storage_account_name=$STATE_SA" \
+            -backend-config="container_name=$STATE_CONTAINER" \
+            -backend-config="key=$STATE_KEY"
+
+      # Applying the saved plan fails if state moved since it was made, so
+      # what was approved is exactly what runs.
+      - name: Apply
+        run: terraform apply -input=false -lock-timeout=300s tfplan

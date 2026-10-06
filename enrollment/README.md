@@ -14,7 +14,7 @@ inventory.csv
 
 The shared parts (the naming convention, the Graph client, the guards, the
 Intune group-ladder consumer and the triggers) live in
-[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.1/enrollment),
+[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.2/enrollment),
 together with their tests and the reasoning behind the guards. This directory
 keeps only the Cimian consumer, which imports `shared/` from there.
 
@@ -26,7 +26,7 @@ projection for its macOS rows.
 Check intune-gitops out beside this repo at the tag the pipelines pin:
 
 ```
-git clone --branch v0.1.1 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
 Then put both enrollment directories on `PYTHONPATH`, **this repo's first**.
@@ -78,12 +78,8 @@ by name, with the `PYTHONPATH` above:
 export ENROLLMENT_CONSUMERS="cimian=consumers.cimian:converge"
 ```
 
-At v0.1.1 each trigger puts its own enrollment directory at the front of
-`sys.path`, so the intune-gitops `consumers` package is found first and
-`consumers.cimian` does not resolve from inside a trigger. Running the consumer
-directly, or `registry.load()` with the path above, works. The trigger route
-needs intune-gitops' `consumers` package to extend its path the same way this
-one does.
+Since v0.1.2 the intune-gitops `consumers` package extends its path, so
+`consumers.cimian` resolves from inside a trigger as well as when run directly.
 
 ## Tests
 

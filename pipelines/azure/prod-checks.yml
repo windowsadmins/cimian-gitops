@@ -1,0 +1,81 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  prod-checks.yml — a weekday look at what production actually serves.
+#
+#  quality/prod_checks.py answers two questions the repo cannot answer by
+#  looking at itself:
+#    stalled  hand-made pkgsinfo that never reached Production, and manifest
+#             conditions that keep an item off the Production fleet
+#    drift    recently changed pkgsinfo missing from a published catalog they
+#             declare, which no device on that catalog can install
+#  It also runs the quality lints over the whole pkgsinfo tree.
+#
+#  Findings are warnings: the run goes yellow and nothing is blocked. Read-only
+#  throughout; the identity needs only Storage Blob Data Reader.
+#
+#  Scripts read pipeline variables from the environment ($env:NAME), never as
+#  $(NAME) macros pasted into script text.
+# ──────────────────────────────────────────────────────────────────────────────
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: '0 15 * * 1-5'            # UTC, weekdays
+    displayName: Weekday production check
+    branches: { include: [main] }
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - name: azureServiceConnection          # workload identity federation, read-only
+    value: '<ado-service-connection>'
+  - name: STORAGE_ACCOUNT
+    value: 'examplecimianstorage'
+  - name: STORAGE_CONTAINER
+    value: 'repo'
+  - name: DRIFT_DAYS
+    value: '4'
+
+steps:
+- checkout: self
+  fetchDepth: 0                        # drift reads recent history
+
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: '3.12'
+
+- bash: python -m pip install --quiet pyyaml
+  displayName: Install PyYAML
+
+- pwsh: |
+    Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber
+    pwsh -NoProfile -File quality/lint/Test-Categories.ps1
+    if ($LASTEXITCODE -ne 0) { Write-Host '##vso[task.logissue type=warning]Category check failed' }
+    pwsh -NoProfile -File quality/lint/Test-PkgsinfoStructure.ps1 -Path deployment/pkgsinfo
+    if ($LASTEXITCODE -ne 0) { Write-Host '##vso[task.logissue type=warning]Structure check failed' }
+    exit 0
+  displayName: Quality lints
+
+- bash: python quality/prod_checks.py stalled --repo .
+  displayName: Items not in Production
+
+- task: AzureCLI@2
+  displayName: Catalog drift
+  condition: succeededOrFailed()
+  inputs:
+    azureSubscription: $(azureServiceConnection)
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -uo pipefail
+      dest="$AGENT_TEMPDIRECTORY/published-catalogs"
+      rm -rf "$dest"; mkdir -p "$dest"
+      for cat in Development Testing Staging Production; do
+        az storage blob download --auth-mode login \
+          --account-name "$STORAGE_ACCOUNT" --container-name "$STORAGE_CONTAINER" \
+          --name "deployment/catalogs/$cat.yaml" --file "$dest/$cat.yaml" \
+          --overwrite --no-progress -o none 2>/dev/null || echo "note: no published $cat catalog"
+      done
+      python quality/prod_checks.py drift --repo . --published "$dest" --days "$DRIFT_DAYS"

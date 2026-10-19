@@ -14,7 +14,7 @@ inventory.csv
 
 The shared parts (the naming convention, the Graph client, the guards, the
 Intune group-ladder consumer and the triggers) live in
-[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.2/enrollment),
+[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.3/enrollment),
 together with their tests and the reasoning behind the guards. This directory
 keeps only the Cimian consumer, which imports `shared/` from there.
 
@@ -26,7 +26,7 @@ projection for its macOS rows.
 Check intune-gitops out beside this repo at the tag the pipelines pin:
 
 ```
-git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+git clone --branch v0.1.3 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
 Then put both enrollment directories on `PYTHONPATH`, **this repo's first**.
